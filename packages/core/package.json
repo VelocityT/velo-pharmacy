@@ -1,0 +1,19 @@
+{
+  "name": "@velocare/core",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Shared domain core — schema, stock ledger, GST, billing, indent, compliance. Consumed by BOTH editions.",
+  "exports": {
+    "./lib/*": "./src/lib/*.ts",
+    "./server/*": "./src/server/*.ts",
+    "./api/*": "./src/api/*.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.2.1",
+    "bcryptjs": "^2.4.3",
+    "decimal.js": "^10.4.3",
+    "jose": "^5.9.6",
+    "next": "^15.1.4",
+    "zod": "^3.24.1"
+  }
+}

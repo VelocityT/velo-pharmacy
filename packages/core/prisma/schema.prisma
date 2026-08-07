@@ -1,0 +1,1270 @@
+// ============================================================
+//  HOSPITAL PHARMACY ERP — Prisma Schema
+//  Multi-tenant (hospitalId) · Multi-store · Batch-level stock
+//  DB: PostgreSQL 15+
+// ============================================================
+//
+//  CORE DESIGN RULES (do not violate these later):
+//  1. Stock is NEVER stored as a mutable column. Every movement
+//     writes an immutable StockLedger row. StockBalance is a
+//     derived cache, rebuildable from the ledger at any time.
+//  2. The atomic stock unit is (Item + Batch + Store), never Item.
+//  3. All money = Decimal(14,2). All quantities = Decimal(14,3)
+//     (loose tablets / ml fractions exist). NEVER Float.
+//  4. Nothing is hard-deleted. deletedAt + AuditLog. Drug records
+//     are legally required to be retrievable for 3+ years.
+//  5. Every table carries hospitalId. Enforce via Prisma middleware
+//     or Postgres RLS — do not rely on the app remembering.
+//  6. OFFLINE RULE: every Store has exactly ONE owning SyncNode.
+//     Only the owning node may write ledger rows that DECREMENT
+//     that store's stock. This is what makes offline merges safe.
+//     See docs/ARCHITECTURE.md section 2.
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+  // rhel-openssl-3.0.x is what Vercel/AWS Lambda runs. Without it the
+  // deployed function cannot find a query engine and every request 500s.
+  binaryTargets = ["native", "rhel-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  // Runtime queries go through the pooler on serverless hosts.
+  url       = env("DATABASE_URL")
+  // Migrations cannot run through a transaction pooler — they need a
+  // direct connection. On-prem sets DIRECT_URL equal to DATABASE_URL.
+  directUrl = env("DIRECT_URL")
+}
+
+// ============================================================
+//  TENANT, STORES, USERS
+// ============================================================
+
+model Hospital {
+  id            String   @id @default(cuid())
+  name          String
+  legalName     String?
+  gstin         String?
+  drugLicenseNo String? // 20B / 21B retail licence
+  address       String?
+  city          String?
+  state         String?
+  stateCode     String? // GST state code — drives CGST/SGST vs IGST
+  pincode       String?
+  phone         String?
+  email         String?
+  logoUrl       String?
+
+  // Financial year + numbering
+  fyStartMonth Int @default(4) // April = Indian FY
+
+  isActive  Boolean   @default(true)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  stores Store[]
+  users  User[]
+
+  @@map("hospitals")
+}
+
+enum StoreType {
+  MAIN // central pharmacy store — receives all purchases
+  SUB // ward / floor / OT / ICU sub-store
+  OPD_COUNTER // outpatient dispensing counter
+  IPD_COUNTER // inpatient dispensing counter
+  NARCOTIC // double-lock narcotic cabinet, tracked separately
+}
+
+model Store {
+  id         String    @id @default(cuid())
+  hospitalId String
+  hospital   Hospital  @relation(fields: [hospitalId], references: [id])
+  code       String // "MAIN", "ICU-2", "OPD-01"
+  name       String
+  type       StoreType
+  location   String?
+
+  // Sub-stores indent FROM their parent. MAIN has no parent.
+  parentStoreId String?
+  parentStore   Store?  @relation("StoreHierarchy", fields: [parentStoreId], references: [id])
+  childStores   Store[] @relation("StoreHierarchy")
+
+  // Only MAIN-type stores may receive GRNs directly from suppliers
+  canReceivePurchase Boolean @default(false)
+  canBillPatient     Boolean @default(false)
+
+  // OFFLINE: the single node permitted to DECREMENT this store's stock.
+  // Null = cloud-owned (the default in pure SaaS mode).
+  owningNodeId String?
+  owningNode   SyncNode? @relation("StoreOwner", fields: [owningNodeId], references: [id])
+
+  isActive  Boolean   @default(true)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  stockBalances StockBalance[]
+  ledgerEntries StockLedger[]
+  grns          Grn[]
+  sales         Sale[]
+  indentsFrom   Indent[]       @relation("IndentFromStore")
+  indentsTo     Indent[]       @relation("IndentToStore")
+  userAccess    UserStore[]
+
+  @@unique([hospitalId, code])
+  @@index([hospitalId, type])
+  @@map("stores")
+}
+
+enum UserRole {
+  SUPER_ADMIN // Velocity / vendor support
+  HOSPITAL_ADMIN
+  PHARMACY_MANAGER
+  PURCHASE_OFFICER
+  PHARMACIST // billing + dispensing
+  STORE_KEEPER // sub-store, indent only
+  ACCOUNTANT
+  AUDITOR // read-only, all reports
+}
+
+model User {
+  id           String   @id @default(cuid())
+  hospitalId   String
+  hospital     Hospital @relation(fields: [hospitalId], references: [id])
+  name         String
+  email        String
+  phone        String?
+  passwordHash String
+  role         UserRole
+
+  // Pharmacist Council registration — printed on Schedule H1 bills
+  pharmacistRegNo String?
+
+  lastLoginAt DateTime?
+  isActive    Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  storeAccess UserStore[]
+  auditLogs   AuditLog[]
+
+  @@unique([hospitalId, email])
+  @@index([hospitalId, role])
+  @@map("users")
+}
+
+// Which stores a user may transact in. A ward storekeeper
+// should not be able to bill at the OPD counter.
+model UserStore {
+  id      String @id @default(cuid())
+  userId  String
+  user    User   @relation(fields: [userId], references: [id])
+  storeId String
+  store   Store  @relation(fields: [storeId], references: [id])
+
+  @@unique([userId, storeId])
+  @@map("user_stores")
+}
+
+// ============================================================
+//  DRUG MASTERS
+// ============================================================
+
+model Manufacturer {
+  id         String    @id @default(cuid())
+  hospitalId String
+  name       String
+  createdAt  DateTime  @default(now())
+  deletedAt  DateTime?
+
+  items Item[]
+
+  @@unique([hospitalId, name])
+  @@map("manufacturers")
+}
+
+// Generic composition. Enables "show me alternates of Crocin"
+// and is the backbone of hospital formulary substitution.
+model Salt {
+  id         String    @id @default(cuid())
+  hospitalId String
+  name       String // "Paracetamol 500mg"
+  createdAt  DateTime  @default(now())
+  deletedAt  DateTime?
+
+  items ItemSalt[]
+
+  @@unique([hospitalId, name])
+  @@map("salts")
+}
+
+model ItemCategory {
+  id         String    @id @default(cuid())
+  hospitalId String
+  name       String // Tablet, Injection, Surgical, Consumable, Implant
+  isDrug     Boolean   @default(true) // false = surgical/consumable, no schedule rules
+  createdAt  DateTime  @default(now())
+  deletedAt  DateTime?
+
+  items Item[]
+
+  @@unique([hospitalId, name])
+  @@map("item_categories")
+}
+
+enum DrugSchedule {
+  NONE // OTC
+  H // Rx required, record kept
+  H1 // Rx required + separate register, 3yr retention
+  X // Narcotic-adjacent, strictest
+  NARCOTIC // NDPS Act — double lock, running balance register
+}
+
+model Item {
+  id         String @id @default(cuid())
+  hospitalId String
+  code       String // internal SKU
+  name       String // "Crocin Advance 500mg Tab"
+
+  categoryId     String
+  category       ItemCategory  @relation(fields: [categoryId], references: [id])
+  manufacturerId String?
+  manufacturer   Manufacturer? @relation(fields: [manufacturerId], references: [id])
+
+  // Packing: 1 box = 10 strips = 150 tablets
+  packing      String? // "10x15"
+  unitOfSale   String  @default("STRIP") // STRIP / TAB / VIAL / BOTTLE
+  unitsPerPack Decimal @default(1) @db.Decimal(14, 3)
+
+  // Tax
+  hsnCode   String?
+  gstRate   Decimal @default(12) @db.Decimal(5, 2) // 5 / 12 / 18 typical for pharma
+  cessRate  Decimal @default(0) @db.Decimal(5, 2)
+
+  schedule     DrugSchedule @default(NONE)
+  isNarcotic   Boolean      @default(false)
+  isRefrigerated Boolean    @default(false) // cold chain — affects ward issue rules
+  isFormulary  Boolean      @default(true) // hospital-approved list
+
+  // Reorder control — per item, overridable per store
+  minStock   Decimal @default(0) @db.Decimal(14, 3)
+  maxStock   Decimal @default(0) @db.Decimal(14, 3)
+  reorderQty Decimal @default(0) @db.Decimal(14, 3)
+
+  barcode String?
+
+  isActive  Boolean   @default(true)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  salts         ItemSalt[]
+  batches       Batch[]
+  stockBalances StockBalance[]
+  ledgerEntries StockLedger[]
+
+  @@unique([hospitalId, code])
+  @@index([hospitalId, name])
+  @@index([hospitalId, barcode])
+  @@index([hospitalId, schedule])
+  @@map("items")
+}
+
+model ItemSalt {
+  id       String  @id @default(cuid())
+  itemId   String
+  item     Item    @relation(fields: [itemId], references: [id])
+  saltId   String
+  salt     Salt    @relation(fields: [saltId], references: [id])
+  strength String? // "500mg"
+
+  @@unique([itemId, saltId])
+  @@map("item_salts")
+}
+
+// ============================================================
+//  BATCH — the atomic stock unit
+// ============================================================
+//
+//  A batch is created once (per item + batchNo + expiry) and is
+//  hospital-wide. Its QUANTITY lives per-store in StockBalance.
+//  Rates live here because they are fixed at purchase time.
+// ============================================================
+
+model Batch {
+  id         String   @id @default(cuid())
+  hospitalId String
+  itemId     String
+  item       Item     @relation(fields: [itemId], references: [id])
+  batchNo    String
+  expiryDate DateTime // store as last day of expiry month
+
+  mfgDate DateTime?
+
+  mrp          Decimal @db.Decimal(14, 2)
+  purchaseRate Decimal @db.Decimal(14, 2) // net of scheme, ex-GST
+  saleRate     Decimal @db.Decimal(14, 2) // what patient is charged
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  stockBalances StockBalance[]
+  ledgerEntries StockLedger[]
+
+  @@unique([hospitalId, itemId, batchNo, expiryDate])
+  @@index([hospitalId, expiryDate]) // near-expiry report
+  @@map("batches")
+}
+
+// Derived cache. Rebuild with:
+//   SELECT storeId,itemId,batchId,SUM(qtyIn-qtyOut) FROM stock_ledger GROUP BY 1,2,3
+// Never write to this outside the stock service.
+model StockBalance {
+  id         String @id @default(cuid())
+  hospitalId String
+  storeId    String
+  store      Store  @relation(fields: [storeId], references: [id])
+  itemId     String
+  item       Item   @relation(fields: [itemId], references: [id])
+  batchId    String
+  batch      Batch  @relation(fields: [batchId], references: [id])
+
+  quantity Decimal @default(0) @db.Decimal(14, 3)
+  // Reserved by an in-progress bill / approved-but-unissued indent
+  reserved Decimal @default(0) @db.Decimal(14, 3)
+
+  updatedAt DateTime @updatedAt
+
+  @@unique([storeId, batchId])
+  @@index([hospitalId, itemId])
+  @@index([storeId, itemId])
+  @@map("stock_balances")
+}
+
+enum LedgerTxnType {
+  GRN // purchase receipt
+  PURCHASE_RETURN
+  SALE
+  SALE_RETURN
+  INDENT_ISSUE // main store -> sub-store (out of source)
+  INDENT_RECEIPT // main store -> sub-store (in at destination)
+  WARD_RETURN // unused ward stock back to main
+  EXPIRY_WRITE_OFF
+  BREAKAGE
+  ADJUSTMENT_IN
+  ADJUSTMENT_OUT
+  OPENING_STOCK
+}
+
+// IMMUTABLE. Append-only. This table is the source of truth
+// for stock, for audit, and for drug-recall traceability.
+model StockLedger {
+  id         String        @id @default(cuid())
+  hospitalId String
+  storeId    String
+  store      Store         @relation(fields: [storeId], references: [id])
+  itemId     String
+  item       Item          @relation(fields: [itemId], references: [id])
+  batchId    String
+  batch      Batch         @relation(fields: [batchId], references: [id])
+  txnType    LedgerTxnType
+
+  qtyIn  Decimal @default(0) @db.Decimal(14, 3)
+  qtyOut Decimal @default(0) @db.Decimal(14, 3)
+  rate   Decimal @db.Decimal(14, 2) // valuation rate at movement time
+
+  // Polymorphic pointer to the document that caused this movement
+  refType String // "GRN" | "SALE" | "INDENT" | "ADJUSTMENT"
+  refId   String
+  refNo   String // human-readable doc number
+
+  remarks   String?
+  createdAt DateTime @default(now())
+  createdBy String
+
+  // OFFLINE: which node appended this row. Ledger rows are insert-only
+  // on sync apply — never updated, never deleted.
+  originNodeId String?
+
+  @@index([originNodeId])
+  @@index([hospitalId, storeId, itemId, createdAt])
+  @@index([batchId]) // recall: "who got batch XYZ123"
+  @@index([refType, refId])
+  @@map("stock_ledger")
+}
+
+// ============================================================
+//  SUPPLIERS & PURCHASE
+// ============================================================
+
+model Supplier {
+  id            String  @id @default(cuid())
+  hospitalId    String
+  name          String
+  gstin         String?
+  drugLicenseNo String?
+  address       String?
+  city          String?
+  stateCode     String? // vs hospital.stateCode -> IGST or CGST+SGST
+  phone         String?
+  email         String?
+
+  creditDays  Int     @default(0)
+  openingBal  Decimal @default(0) @db.Decimal(14, 2)
+
+  isActive  Boolean   @default(true)
+  createdAt DateTime  @default(now())
+  deletedAt DateTime?
+
+  purchaseOrders PurchaseOrder[]
+  grns           Grn[]
+  returns        PurchaseReturn[]
+
+  @@index([hospitalId, name])
+  @@map("suppliers")
+}
+
+enum PoStatus {
+  DRAFT
+  APPROVED
+  PARTIALLY_RECEIVED
+  RECEIVED
+  CANCELLED
+}
+
+model PurchaseOrder {
+  id         String   @id @default(cuid())
+  hospitalId String
+  poNo       String
+  poDate     DateTime
+  supplierId String
+  supplier   Supplier @relation(fields: [supplierId], references: [id])
+  status     PoStatus @default(DRAFT)
+
+  expectedDate DateTime?
+  remarks      String?
+  totalAmount  Decimal   @default(0) @db.Decimal(14, 2)
+
+  approvedBy String?
+  approvedAt DateTime?
+  createdBy  String
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  lines PurchaseOrderLine[]
+  grns  Grn[]
+
+  @@unique([hospitalId, poNo])
+  @@index([hospitalId, status])
+  @@map("purchase_orders")
+}
+
+model PurchaseOrderLine {
+  id      String        @id @default(cuid())
+  poId    String
+  po      PurchaseOrder @relation(fields: [poId], references: [id], onDelete: Cascade)
+  itemId  String
+  qty     Decimal       @db.Decimal(14, 3)
+  rate    Decimal       @db.Decimal(14, 2)
+  qtyRecd Decimal       @default(0) @db.Decimal(14, 3)
+
+  @@index([poId])
+  @@map("purchase_order_lines")
+}
+
+// Goods Receipt Note = supplier invoice entry. This is where
+// batches get created and stock enters the building.
+model Grn {
+  id         String   @id @default(cuid())
+  hospitalId String
+  grnNo      String
+  grnDate    DateTime
+
+  supplierId String
+  supplier   Supplier @relation(fields: [supplierId], references: [id])
+  storeId    String // must be a store with canReceivePurchase = true
+  store      Store    @relation(fields: [storeId], references: [id])
+
+  poId String?
+  po   PurchaseOrder? @relation(fields: [poId], references: [id])
+
+  supplierInvoiceNo   String
+  supplierInvoiceDate DateTime
+
+  grossAmount  Decimal @default(0) @db.Decimal(14, 2)
+  discountAmt  Decimal @default(0) @db.Decimal(14, 2)
+  taxableAmt   Decimal @default(0) @db.Decimal(14, 2)
+  cgstAmt      Decimal @default(0) @db.Decimal(14, 2)
+  sgstAmt      Decimal @default(0) @db.Decimal(14, 2)
+  igstAmt      Decimal @default(0) @db.Decimal(14, 2)
+  cessAmt      Decimal @default(0) @db.Decimal(14, 2)
+  roundOff     Decimal @default(0) @db.Decimal(14, 2)
+  netAmount    Decimal @default(0) @db.Decimal(14, 2)
+
+  isPosted  Boolean   @default(false) // posting writes the ledger
+  postedAt  DateTime?
+
+  originNodeId String?
+  clientUuid   String?
+
+  createdBy String
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  lines    GrnLine[]
+  payments SupplierPayment[]
+
+  @@unique([hospitalId, grnNo])
+  @@unique([hospitalId, clientUuid])
+  @@unique([hospitalId, supplierId, supplierInvoiceNo]) // blocks duplicate invoice entry
+  @@index([hospitalId, grnDate])
+  @@map("grns")
+}
+
+model GrnLine {
+  id    String @id @default(cuid())
+  grnId String
+  grn   Grn    @relation(fields: [grnId], references: [id], onDelete: Cascade)
+
+  itemId  String
+  batchId String // created/matched during GRN entry
+
+  qty     Decimal @db.Decimal(14, 3)
+  freeQty Decimal @default(0) @db.Decimal(14, 3) // scheme goods — costed at 0
+
+  rate        Decimal @db.Decimal(14, 2)
+  discountPct Decimal @default(0) @db.Decimal(5, 2)
+  taxableAmt  Decimal @db.Decimal(14, 2)
+  gstRate     Decimal @db.Decimal(5, 2)
+  gstAmt      Decimal @db.Decimal(14, 2)
+  lineTotal   Decimal @db.Decimal(14, 2)
+
+  @@index([grnId])
+  @@map("grn_lines")
+}
+
+model PurchaseReturn {
+  id         String   @id @default(cuid())
+  hospitalId String
+  returnNo   String
+  returnDate DateTime
+  supplierId String
+  supplier   Supplier @relation(fields: [supplierId], references: [id])
+  storeId    String
+
+  reason    String // EXPIRY / DAMAGE / WRONG_SUPPLY / RECALL
+  netAmount Decimal @default(0) @db.Decimal(14, 2)
+
+  isPosted  Boolean  @default(false)
+  createdBy String
+  createdAt DateTime @default(now())
+
+  lines PurchaseReturnLine[]
+
+  @@unique([hospitalId, returnNo])
+  @@map("purchase_returns")
+}
+
+model PurchaseReturnLine {
+  id       String         @id @default(cuid())
+  returnId String
+  ret      PurchaseReturn @relation(fields: [returnId], references: [id], onDelete: Cascade)
+  itemId   String
+  batchId  String
+  qty      Decimal        @db.Decimal(14, 3)
+  rate     Decimal        @db.Decimal(14, 2)
+  gstAmt   Decimal        @default(0) @db.Decimal(14, 2)
+  lineTotal Decimal       @db.Decimal(14, 2)
+
+  @@index([returnId])
+  @@map("purchase_return_lines")
+}
+
+model SupplierPayment {
+  id         String   @id @default(cuid())
+  hospitalId String
+  paymentNo  String
+  paymentDate DateTime
+  supplierId String
+  grnId      String?
+  grn        Grn?     @relation(fields: [grnId], references: [id])
+
+  amount Decimal @db.Decimal(14, 2)
+  mode   String // CASH / NEFT / CHEQUE / UPI
+  refNo  String?
+
+  createdBy String
+  createdAt DateTime @default(now())
+
+  @@unique([hospitalId, paymentNo])
+  @@index([hospitalId, supplierId])
+  @@map("supplier_payments")
+}
+
+// ============================================================
+//  INDENT — the hospital-specific flow Marg does not have
+//  Ward requests -> Main store approves -> issues -> ward receives
+// ============================================================
+
+enum IndentStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  PARTIALLY_ISSUED
+  ISSUED
+  RECEIVED
+  REJECTED
+  CANCELLED
+}
+
+model Indent {
+  id         String       @id @default(cuid())
+  hospitalId String
+  indentNo   String
+  indentDate DateTime
+  status     IndentStatus @default(DRAFT)
+
+  // Requesting store (ward/ICU) pulls FROM the supplying store
+  fromStoreId String // supplying store (usually MAIN)
+  fromStore   Store  @relation("IndentFromStore", fields: [fromStoreId], references: [id])
+  toStoreId   String // requesting store
+  toStore     Store  @relation("IndentToStore", fields: [toStoreId], references: [id])
+
+  isEmergency Boolean @default(false)
+  remarks     String?
+
+  requestedBy String
+  approvedBy  String?
+  approvedAt  DateTime?
+  issuedBy    String?
+  issuedAt    DateTime?
+  receivedBy  String?
+  receivedAt  DateTime?
+
+  originNodeId String?
+  clientUuid   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  lines IndentLine[]
+
+  @@unique([hospitalId, indentNo])
+  @@unique([hospitalId, clientUuid])
+  @@index([hospitalId, status])
+  @@index([toStoreId, status])
+  @@map("indents")
+}
+
+model IndentLine {
+  id       String @id @default(cuid())
+  indentId String
+  indent   Indent @relation(fields: [indentId], references: [id], onDelete: Cascade)
+  itemId   String
+
+  qtyRequested Decimal @db.Decimal(14, 3)
+  qtyApproved  Decimal @default(0) @db.Decimal(14, 3)
+  qtyIssued    Decimal @default(0) @db.Decimal(14, 3)
+
+  // Batches are chosen at ISSUE time (FEFO), not at request time
+  issues IndentIssueBatch[]
+
+  @@index([indentId])
+  @@map("indent_lines")
+}
+
+model IndentIssueBatch {
+  id           String     @id @default(cuid())
+  indentLineId String
+  indentLine   IndentLine @relation(fields: [indentLineId], references: [id], onDelete: Cascade)
+  batchId      String
+  qty          Decimal    @db.Decimal(14, 3)
+  rate         Decimal    @db.Decimal(14, 2)
+
+  @@index([indentLineId])
+  @@map("indent_issue_batches")
+}
+
+// ============================================================
+//  PATIENTS & DOCTORS
+// ============================================================
+
+model Doctor {
+  id           String  @id @default(cuid())
+  hospitalId   String
+  name         String
+  registrationNo String? // required on Schedule H1 register
+  department   String?
+  phone        String?
+
+  isActive  Boolean   @default(true)
+  createdAt DateTime  @default(now())
+  deletedAt DateTime?
+
+  prescriptions Prescription[]
+
+  @@index([hospitalId, name])
+  @@map("doctors")
+}
+
+enum PatientType {
+  OPD
+  IPD
+  EMERGENCY
+  WALK_IN // no hospital registration — pure counter sale
+}
+
+model Patient {
+  id         String   @id @default(cuid())
+  hospitalId String
+  uhid       String? // hospital's master patient index number
+  name       String
+  age        Int?
+  gender     String?
+  phone      String?
+  address    String?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  visits        PatientVisit[]
+  prescriptions Prescription[]
+  sales         Sale[]
+
+  @@index([hospitalId, uhid])
+  @@index([hospitalId, phone])
+  @@index([hospitalId, name])
+  @@map("patients")
+}
+
+// An OPD visit or an IPD admission. IPD pharmacy charges post
+// against this, and settle when the admission is discharged.
+model PatientVisit {
+  id         String      @id @default(cuid())
+  hospitalId String
+  patientId  String
+  patient    Patient     @relation(fields: [patientId], references: [id])
+  visitNo    String
+  type       PatientType
+
+  admittedAt DateTime
+  dischargedAt DateTime?
+  wardStoreId String? // which ward — drives consumption reporting
+  bedNo      String?
+
+  isBillClosed Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  prescriptions Prescription[]
+  sales         Sale[]
+
+  @@unique([hospitalId, visitNo])
+  @@index([hospitalId, patientId])
+  @@map("patient_visits")
+}
+
+model Prescription {
+  id         String        @id @default(cuid())
+  hospitalId String
+  rxNo       String
+  rxDate     DateTime
+  patientId  String
+  patient    Patient       @relation(fields: [patientId], references: [id])
+  visitId    String?
+  visit      PatientVisit? @relation(fields: [visitId], references: [id])
+  doctorId   String
+  doctor     Doctor        @relation(fields: [doctorId], references: [id])
+
+  notes       String?
+  scanUrl     String? // photo of paper Rx — needed for H1 audit
+  isDispensed Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  lines PrescriptionLine[]
+  sales Sale[]
+
+  @@unique([hospitalId, rxNo])
+  @@index([hospitalId, patientId])
+  @@map("prescriptions")
+}
+
+model PrescriptionLine {
+  id       String       @id @default(cuid())
+  rxId     String
+  rx       Prescription @relation(fields: [rxId], references: [id], onDelete: Cascade)
+  itemId   String
+  qty      Decimal      @db.Decimal(14, 3)
+  dosage   String? // "1-0-1 after food"
+  days     Int?
+  qtyDispensed Decimal  @default(0) @db.Decimal(14, 3)
+
+  @@index([rxId])
+  @@map("prescription_lines")
+}
+
+// ============================================================
+//  SALES / DISPENSING
+// ============================================================
+
+enum SaleType {
+  CASH // walk-in, paid now
+  CREDIT_IPD // charged to admission, settles at discharge
+  CREDIT_TPA // insurance / panel
+  STAFF // employee concession
+}
+
+enum PaymentMode {
+  CASH
+  UPI
+  CARD
+  CREDIT
+  MIXED
+}
+
+model Sale {
+  id         String   @id @default(cuid())
+  hospitalId String
+  billNo     String
+  billDate   DateTime
+  storeId    String
+  store      Store    @relation(fields: [storeId], references: [id])
+
+  saleType SaleType @default(CASH)
+
+  patientId String?
+  patient   Patient?      @relation(fields: [patientId], references: [id])
+  visitId   String?
+  visit     PatientVisit? @relation(fields: [visitId], references: [id])
+  rxId      String?
+  rx        Prescription? @relation(fields: [rxId], references: [id])
+
+  // Denormalised for walk-in patients with no master record
+  customerName  String?
+  customerPhone String?
+
+  grossAmount Decimal @default(0) @db.Decimal(14, 2)
+  discountAmt Decimal @default(0) @db.Decimal(14, 2)
+  taxableAmt  Decimal @default(0) @db.Decimal(14, 2)
+  cgstAmt     Decimal @default(0) @db.Decimal(14, 2)
+  sgstAmt     Decimal @default(0) @db.Decimal(14, 2)
+  igstAmt     Decimal @default(0) @db.Decimal(14, 2)
+  roundOff    Decimal @default(0) @db.Decimal(14, 2)
+  netAmount   Decimal @default(0) @db.Decimal(14, 2)
+
+  paymentMode PaymentMode @default(CASH)
+  paidAmount  Decimal     @default(0) @db.Decimal(14, 2)
+
+  isCancelled Boolean   @default(false)
+  cancelledAt DateTime?
+  cancelReason String?
+
+  // OFFLINE: clientUuid is minted by the counter BEFORE the bill posts,
+  // so a retried flush upserts instead of double-posting.
+  originNodeId    String?
+  clientUuid      String?
+  isOfflineOrigin Boolean   @default(false)
+  syncedAt        DateTime?
+
+  createdBy String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  lines   SaleLine[]
+  returns SaleReturn[]
+
+  @@unique([hospitalId, billNo])
+  @@unique([hospitalId, clientUuid])
+  @@index([hospitalId, billDate])
+  @@index([storeId, billDate])
+  @@index([visitId]) // discharge bill assembly
+  @@map("sales")
+}
+
+model SaleLine {
+  id     String @id @default(cuid())
+  saleId String
+  sale   Sale   @relation(fields: [saleId], references: [id], onDelete: Cascade)
+
+  itemId  String
+  batchId String // FEFO-allocated at billing time
+
+  qty         Decimal @db.Decimal(14, 3)
+  mrp         Decimal @db.Decimal(14, 2)
+  rate        Decimal @db.Decimal(14, 2)
+  discountPct Decimal @default(0) @db.Decimal(5, 2)
+  taxableAmt  Decimal @db.Decimal(14, 2)
+  gstRate     Decimal @db.Decimal(5, 2)
+  gstAmt      Decimal @db.Decimal(14, 2)
+  lineTotal   Decimal @db.Decimal(14, 2)
+
+  qtyReturned Decimal @default(0) @db.Decimal(14, 3)
+
+  @@index([saleId])
+  @@index([batchId])
+  @@map("sale_lines")
+}
+
+model SaleReturn {
+  id         String   @id @default(cuid())
+  hospitalId String
+  returnNo   String
+  returnDate DateTime
+  saleId     String
+  sale       Sale     @relation(fields: [saleId], references: [id])
+  storeId    String
+
+  reason    String?
+  netAmount Decimal @default(0) @db.Decimal(14, 2)
+
+  originNodeId String?
+  clientUuid   String?
+
+  createdBy String
+  createdAt DateTime @default(now())
+
+  lines SaleReturnLine[]
+
+  @@unique([hospitalId, returnNo])
+  @@unique([hospitalId, clientUuid])
+  @@map("sale_returns")
+}
+
+model SaleReturnLine {
+  id       String     @id @default(cuid())
+  returnId String
+  ret      SaleReturn @relation(fields: [returnId], references: [id], onDelete: Cascade)
+  itemId   String
+  batchId  String
+  qty      Decimal    @db.Decimal(14, 3)
+  rate     Decimal    @db.Decimal(14, 2)
+  gstAmt   Decimal    @default(0) @db.Decimal(14, 2)
+  lineTotal Decimal   @db.Decimal(14, 2)
+
+  @@index([returnId])
+  @@map("sale_return_lines")
+}
+
+// ============================================================
+//  COMPLIANCE REGISTERS
+// ============================================================
+
+// Schedule H1 register — legally must be maintained separately
+// and retained 3 years. Written automatically on every H1 sale.
+model ScheduleH1Register {
+  id         String   @id @default(cuid())
+  hospitalId String
+  entryDate  DateTime
+
+  saleId  String
+  itemId  String
+  batchId String
+  qty     Decimal @db.Decimal(14, 3)
+
+  patientName    String
+  patientAddress String?
+  doctorName     String
+  doctorRegNo    String?
+  rxNo           String?
+
+  dispensedBy String // pharmacist user id
+  createdAt   DateTime @default(now())
+
+  @@index([hospitalId, entryDate])
+  @@map("schedule_h1_register")
+}
+
+// NDPS narcotic register — running balance must reconcile daily.
+model NarcoticRegister {
+  id         String   @id @default(cuid())
+  hospitalId String
+  entryDate  DateTime
+  storeId    String
+  itemId     String
+  batchId    String
+
+  openingBal Decimal @db.Decimal(14, 3)
+  qtyIn      Decimal @default(0) @db.Decimal(14, 3)
+  qtyOut     Decimal @default(0) @db.Decimal(14, 3)
+  closingBal Decimal @db.Decimal(14, 3)
+
+  refType String
+  refId   String
+
+  patientName String?
+  doctorName  String?
+  witnessedBy String? // second signature — NDPS requirement
+
+  createdBy String
+  createdAt DateTime @default(now())
+
+  @@index([hospitalId, storeId, itemId, entryDate])
+  @@map("narcotic_register")
+}
+
+// ============================================================
+//  STOCK ADJUSTMENT & PHYSICAL VERIFICATION
+// ============================================================
+
+enum AdjustmentReason {
+  EXPIRY
+  BREAKAGE
+  THEFT
+  PHYSICAL_COUNT
+  RECALL
+  OTHER
+}
+
+model StockAdjustment {
+  id         String           @id @default(cuid())
+  hospitalId String
+  adjNo      String
+  adjDate    DateTime
+  storeId    String
+  reason     AdjustmentReason
+
+  remarks    String?
+  approvedBy String?
+  approvedAt DateTime?
+
+  isPosted  Boolean  @default(false)
+  createdBy String
+  createdAt DateTime @default(now())
+
+  lines StockAdjustmentLine[]
+
+  @@unique([hospitalId, adjNo])
+  @@map("stock_adjustments")
+}
+
+model StockAdjustmentLine {
+  id      String          @id @default(cuid())
+  adjId   String
+  adj     StockAdjustment @relation(fields: [adjId], references: [id], onDelete: Cascade)
+  itemId  String
+  batchId String
+
+  systemQty Decimal @db.Decimal(14, 3)
+  actualQty Decimal @db.Decimal(14, 3)
+  diffQty   Decimal @db.Decimal(14, 3) // actual - system
+  rate      Decimal @db.Decimal(14, 2)
+
+  @@index([adjId])
+  @@map("stock_adjustment_lines")
+}
+
+// ============================================================
+//  DOCUMENT NUMBERING & AUDIT
+// ============================================================
+
+// Row-locked counters. Take a FOR UPDATE lock inside the same
+// transaction as the document insert — otherwise two counters
+// billing simultaneously will collide on billNo.
+model DocumentSequence {
+  id         String @id @default(cuid())
+  hospitalId String
+  storeId    String?
+  docType    String // "SALE" | "GRN" | "INDENT" | "PO"
+  prefix     String // "INV/25-26/"
+  fyYear     String // "2025-26"
+  lastNumber Int    @default(0)
+
+  updatedAt DateTime @updatedAt
+
+  @@unique([hospitalId, storeId, docType, fyYear])
+  @@map("document_sequences")
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  hospitalId String
+  userId     String
+  user       User     @relation(fields: [userId], references: [id])
+
+  action     String // CREATE / UPDATE / DELETE / POST / CANCEL / LOGIN
+  entityType String
+  entityId   String
+
+  oldValue Json?
+  newValue Json?
+
+  ipAddress String?
+  userAgent String?
+  createdAt DateTime @default(now())
+
+  @@index([hospitalId, entityType, entityId])
+  @@index([hospitalId, createdAt])
+  @@map("audit_logs")
+}
+
+// ============================================================
+//  SYNC LAYER — makes the SAME schema run offline and online
+// ============================================================
+//
+//  Design notes (see docs/ARCHITECTURE.md):
+//   · StockLedger is append-only, so it merges by union — no
+//     conflict resolution needed for the hardest table.
+//   · Every Store has ONE owning node (Store.owningNodeId).
+//     Only that node may decrement its stock. This is what
+//     prevents negative stock after an offline merge.
+//   · Masters (items, suppliers, patients) are last-writer-wins
+//     on updatedAt. Correct for reference data.
+// ============================================================
+
+enum NodeMode {
+  CLOUD // the hosted multi-tenant instance
+  ONPREM_SERVER // hospital's own LAN server (Docker: app + postgres)
+  EDGE_COUNTER // a single billing counter running offline-capable PWA
+}
+
+model SyncNode {
+  id         String   @id @default(cuid())
+  hospitalId String
+  nodeKey    String // "CLOUD" | "HOSP-SERVER" | "COUNTER-01"
+  name       String
+  mode       NodeMode
+
+  // Set once at pairing. Used to sign push/pull requests.
+  authTokenHash String?
+
+  lastSeenAt   DateTime?
+  lastPushedAt DateTime?
+  lastPulledAt DateTime?
+
+  // Highest Lamport counter this node has issued. Monotonic,
+  // bumped inside the same transaction as the outbox write.
+  lamportClock BigInt @default(0)
+
+  isActive  Boolean   @default(true)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  ownedStores    Store[]         @relation("StoreOwner")
+  outbox         SyncOutbox[]
+  cursorsAsLocal SyncCursor[]    @relation("CursorLocalNode")
+  cursorsAsPeer  SyncCursor[]    @relation("CursorPeerNode")
+  sequenceBlocks SequenceBlock[]
+
+  @@unique([hospitalId, nodeKey])
+  @@index([hospitalId, mode])
+  @@map("sync_nodes")
+}
+
+enum SyncOp {
+  UPSERT
+  DELETE // soft — sets deletedAt on apply, never a hard delete
+  LEDGER_APPEND // insert-if-absent only; apply layer refuses updates
+}
+
+// Written inside the SAME transaction as the business document.
+// If the document commits, the outbox row commits with it —
+// this is what makes the sync exactly-once rather than best-effort.
+model SyncOutbox {
+  id         String   @id @default(cuid())
+  hospitalId String
+  nodeId     String
+  node       SyncNode @relation(fields: [nodeId], references: [id])
+
+  entity   String // "Sale" | "StockLedger" | "Item" | ...
+  entityId String
+  op       SyncOp
+
+  payload Json
+
+  // Monotonic per node. Peers apply in ascending order within a
+  // node; cross-node order is irrelevant because of store ownership.
+  lamport BigInt
+
+  syncedAt  DateTime?
+  attempts  Int       @default(0)
+  lastError String?
+
+  createdAt DateTime @default(now())
+
+  @@unique([nodeId, lamport])
+  @@index([hospitalId, syncedAt])
+  @@index([entity, entityId])
+  @@map("sync_outbox")
+}
+
+// "I (localNode) have applied everything from peerNode up to lastLamport."
+model SyncCursor {
+  id         String   @id @default(cuid())
+  hospitalId String
+  nodeId     String
+  node       SyncNode @relation("CursorLocalNode", fields: [nodeId], references: [id])
+  peerNodeId String
+  peerNode   SyncNode @relation("CursorPeerNode", fields: [peerNodeId], references: [id])
+
+  lastLamport  BigInt   @default(0)
+  lastSyncedAt DateTime?
+
+  updatedAt DateTime @updatedAt
+
+  @@unique([nodeId, peerNodeId])
+  @@map("sync_cursors")
+}
+
+// Offline-safe document numbering. A node reserves a contiguous
+// range while online and bills from it while offline, so two
+// counters can never collide on billNo.
+//
+// Gaps in the series are legally fine under GST (uniqueness +
+// sequence within a series). Duplicates are not.
+model SequenceBlock {
+  id         String   @id @default(cuid())
+  hospitalId String
+  nodeId     String
+  node       SyncNode @relation(fields: [nodeId], references: [id])
+  storeId    String?
+
+  docType String // "SALE" | "GRN" | "INDENT" | "PO"
+  fyYear  String // "2025-26"
+  prefix  String // "INV/25-26/C1/"
+
+  rangeStart Int
+  rangeEnd   Int
+  nextNumber Int
+
+  exhausted Boolean @default(false)
+
+  reservedAt DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  @@unique([hospitalId, nodeId, docType, fyYear, rangeStart])
+  @@index([hospitalId, nodeId, docType, fyYear, exhausted])
+  @@map("sequence_blocks")
+}
+
+// Conflicts that could NOT be auto-resolved land here for a human.
+// In a correct implementation this table stays empty — treat any
+// row in it as a bug report, not as routine operations.
+model SyncConflict {
+  id         String @id @default(cuid())
+  hospitalId String
+
+  entity     String
+  entityId   String
+  localValue Json
+  peerValue  Json
+  peerNodeId String
+
+  reason String // "STORE_OWNERSHIP_VIOLATION" | "LEDGER_MUTATION_ATTEMPT" | ...
+
+  resolvedAt DateTime?
+  resolvedBy String?
+  resolution String?
+
+  createdAt DateTime @default(now())
+
+  @@index([hospitalId, resolvedAt])
+  @@map("sync_conflicts")
+}

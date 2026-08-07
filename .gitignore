@@ -1,0 +1,37 @@
+# ══ NEVER COMMIT ══════════════════════════════════════════════
+# Real secrets. .env.example files ARE committed — they carry no values.
+.env
+.env.*
+!.env.example
+
+# Database dumps from the on-prem nightly backup job.
+# These contain live patient and prescription data.
+backups/
+*.dump
+*.sql.gz
+
+# ══ BUILD OUTPUT ══════════════════════════════════════════════
+node_modules/
+.next/
+out/
+dist/
+.turbo/
+*.tsbuildinfo
+next-env.d.ts
+
+# ══ TOOLING ═══════════════════════════════════════════════════
+.vercel/
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+# ══ MUST BE COMMITTED — listed so nobody "tidies" them away ═══
+# packages/core/prisma/migrations/   ← deploys apply these; without
+#                                      them a fresh database is empty
+# package-lock.json                  ← Vercel needs it for a reproducible
+#                                      install
+# templates/*.xlsx                   ← the client data-collection workbook

@@ -1,0 +1,17 @@
+{
+  "name": "@velocare/ui",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Shared screens. Both editions render the same counter — only branding and licensing differ.",
+  "exports": {
+    "./screens/*": "./src/screens/*.tsx",
+    "./lib/*": "./src/lib/*.ts"
+  },
+  "dependencies": {
+    "@velocare/core": "*",
+    "idb": "^8.0.1",
+    "next": "^15.1.4",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  }
+}

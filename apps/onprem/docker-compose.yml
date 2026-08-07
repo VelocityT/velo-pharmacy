@@ -1,0 +1,72 @@
+# ─────────────────────────────────────────────────────────────
+#  ON-PREMISE INSTALL (Mode B — fully offline)
+#
+#  One command on the hospital's own server PC:
+#      docker compose up -d
+#
+#  Counters then browse to http://<server-ip>:3000 over the LAN.
+#  No internet required at any point, including for updates —
+#  ship a new image tarball and `docker load` it.
+# ─────────────────────────────────────────────────────────────
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: velocare-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: velocare
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme_on_install}
+      POSTGRES_DB: velocare_pharmacy
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Nightly dump to a folder the hospital's own backup can pick up.
+      # An on-prem client has no cloud safety net; this is not optional.
+      - ./backups:/backups
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U velocare -d velocare_pharmacy"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build:
+      context: ../..
+      dockerfile: apps/onprem/Dockerfile
+    container_name: velocare-app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_MODE: ONPREM_SERVER
+      NODE_KEY: HOSP-SERVER
+      DATABASE_URL: postgresql://velocare:${DB_PASSWORD:-changeme_on_install}@db:5432/velocare_pharmacy?schema=public
+      DIRECT_URL: postgresql://velocare:${DB_PASSWORD:-changeme_on_install}@db:5432/velocare_pharmacy?schema=public
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set — no fallback, by design}
+      SYNC_ENABLED: ${SYNC_ENABLED:-false}
+      SYNC_PEER_URL: ${SYNC_PEER_URL:-}
+      SEQUENCE_BLOCK_SIZE: 1000
+    ports:
+      - "3000:3000"
+
+  backup:
+    image: postgres:15-alpine
+    container_name: velocare-backup
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${DB_PASSWORD:-changeme_on_install}
+    volumes:
+      - ./backups:/backups
+    entrypoint: >
+      sh -c 'while true; do
+        pg_dump -h db -U velocare -d velocare_pharmacy -Fc
+          -f /backups/velocare-$$(date +%%Y%%m%%d-%%H%%M).dump;
+        find /backups -name "*.dump" -mtime +30 -delete;
+        sleep 86400;
+      done'
+
+volumes:
+  pgdata:
