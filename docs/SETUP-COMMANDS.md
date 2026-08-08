@@ -95,6 +95,10 @@ No extra flags needed. Neon scales to zero after ~5 minutes idle but wakes autom
 
 ## Step 3 · Create your .env
 
+**One file, at the repository root** — `D:\Velocare-pharmacy\.env`. Not inside `apps\`.
+
+Prisma CLI commands run from the root, so that's the only place Prisma looks. Both Next apps are configured to read the same file. A second `.env` inside `apps\cloud\` will drift out of sync and produce `Environment variable not found` from whichever tool you run second.
+
 Generate a secret first:
 
 ```powershell
@@ -104,7 +108,7 @@ Generate a secret first:
 Copy the output. Then create the file:
 
 ```powershell
-notepad apps\cloud\.env
+notepad .env
 ```
 
 Notepad asks to create it — say yes. Paste this, substituting your three values:
@@ -122,7 +126,11 @@ SEQUENCE_BLOCK_SIZE=1000
 
 Save, close.
 
-> Keep the double quotes around the URLs — they contain `?` and `&`, which the shell will otherwise mangle.
+> **Percent-encode special characters in the database password.** A raw `/` ends the host section of a URL, so the connection string silently parses wrong and you get an authentication failure that looks like a wrong password. `/` → `%2F`, `$` → `%24`, `@` → `%40`, `#` → `%23`, `?` → `%3F`, `%` → `%25`.
+>
+> **Easier: use an alphanumeric database password** (Supabase → Settings → Database → Reset password) and skip the encoding entirely. Letters and digits only, 20+ characters, still perfectly strong.
+>
+> Keep the double quotes around the URLs — they contain `?` and `&`, which PowerShell will otherwise mangle.
 >
 > This file is git-ignored and must stay that way. A leaked `JWT_SECRET` lets anyone mint an admin token for your system.
 

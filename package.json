@@ -11,22 +11,29 @@
     "dev:onprem": "npm run dev -w @velocare/onprem",
     "build:cloud": "npm run build -w @velocare/cloud",
     "build:onprem": "npm run build -w @velocare/onprem",
+    "env:check": "node scripts/check-env.mjs",
+    "db:find": "node scripts/find-db-host.mjs",
     "db:generate": "prisma generate --schema packages/core/prisma/schema.prisma",
-    "db:migrate": "prisma migrate dev --schema packages/core/prisma/schema.prisma",
-    "db:deploy": "prisma migrate deploy --schema packages/core/prisma/schema.prisma",
-    "db:validate": "prisma validate --schema packages/core/prisma/schema.prisma",
-    "db:seed": "tsx packages/core/prisma/seed.ts",
-    "db:studio": "prisma studio --schema packages/core/prisma/schema.prisma",
-    "stock:rebuild": "tsx packages/core/scripts/rebuild-stock-balance.ts",
+    "db:migrate": "dotenv -e .env -- prisma migrate dev --schema packages/core/prisma/schema.prisma",
+    "db:deploy": "dotenv -e .env -- prisma migrate deploy --schema packages/core/prisma/schema.prisma",
+    "db:validate": "dotenv -e .env -- prisma validate --schema packages/core/prisma/schema.prisma",
+    "db:seed": "dotenv -e .env -- tsx packages/core/prisma/seed.ts",
+    "db:studio": "dotenv -e .env -- prisma studio --schema packages/core/prisma/schema.prisma",
+    "stock:rebuild": "dotenv -e .env -- tsx packages/core/scripts/rebuild-stock-balance.ts",
     "test": "node packages/core/tests/gst.spec.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "devDependencies": {
+    "dotenv": "^16.4.7",
+    "dotenv-cli": "^8.0.0",
     "@types/bcryptjs": "^2.4.6",
     "@types/node": "^22.10.5",
     "@types/react": "^19.0.7",
     "prisma": "^6.2.1",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.3"
+    "typescript": "^5.7.3",
+    "tailwindcss": "^4.0.0",
+    "@tailwindcss/postcss": "^4.0.0",
+    "postcss": "^8.5.1"
   }
 }

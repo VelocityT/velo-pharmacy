@@ -1,0 +1,5 @@
+/* Tailwind v4 scans sources it can reach from the entry stylesheet.
+   The workspace packages live outside this app, so declare them. */
+@import "@velocare/ui/styles/globals.css";
+@source "../../../../packages/ui/src";
+@source "../";

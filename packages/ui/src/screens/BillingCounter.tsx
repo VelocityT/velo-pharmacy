@@ -1,42 +1,31 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
 import {
-  newClientUuid,
-  queueSale,
-  flushQueue,
-  pendingCount,
-  searchOffline,
-  fefoOffline,
-  consumeSnapshot,
-  saveSnapshot,
-  snapshotAge,
-  type StockSnapshotRow,
-} from "@velocare/ui/lib/offline-queue";
+  Search, Trash2, Wifi, WifiOff, CloudUpload, CheckCircle2, TriangleAlert,
+  Loader2, LayoutDashboard, Banknote, ShieldAlert,
+} from "lucide-react";
+import {
+  newClientUuid, queueSale, flushQueue, pendingCount, searchOffline,
+  fefoOffline, consumeSnapshot, saveSnapshot, snapshotAge, type StockSnapshotRow,
+} from "../lib/offline-queue";
+import { Badge, Button } from "../components/ui";
+import { cn } from "../lib/cn";
 
 /**
  * ────────────────────────────────────────────────────────────────
  *  BILLING COUNTER
  * ────────────────────────────────────────────────────────────────
  *
- *  Design constraint that drives everything here: a pharmacist bills
- *  with one hand on the keyboard and one on the strip. If a bill
- *  needs the mouse, the queue backs up and the software gets blamed.
- *  So: every action has a function key, focus never leaves the search
- *  box unless the user sends it elsewhere, and Enter always does the
- *  obvious next thing.
+ *  The constraint that drives every decision here: a pharmacist bills
+ *  with one hand on the keyboard and one on the strip. If a bill needs
+ *  the mouse, the queue backs up and the software gets blamed. So every
+ *  action has a function key, focus returns to search after each add,
+ *  and Enter always does the obvious next thing.
  *
- *  Keys
- *    F2            search box
- *    ↑ ↓ Enter     pick an item
- *    F4            cycle payment mode
- *    F6            delete the highlighted line
- *    F9 / Ctrl+↵   save and print
- *    Esc           clear the cart
- *
- *  Offline: when the connection drops the bill is queued locally
- *  against a stock snapshot and flushed on reconnect. The cashier
- *  sees the state change; they never see an error.
+ *  Full-bleed by design — no sidebar. A counter screen competing with
+ *  navigation is a counter screen that loses.
  */
 
 interface CartLine {
@@ -53,62 +42,48 @@ interface CartLine {
   schedule: string;
 }
 
-const money = (n: number) =>
-  "₹" + n.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+const inr = (n: number) =>
+  "₹" + n.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
-const PAYMENT_MODES = ["CASH", "UPI", "CARD", "CREDIT"] as const;
+const MODES = ["CASH", "UPI", "CARD", "CREDIT"] as const;
 
-export default function BillingCounterPage() {
+export default function BillingCounter() {
   const [online, setOnline] = useState(true);
   const [queued, setQueued] = useState(0);
+  const [snapAge, setSnapAge] = useState<number | null>(null);
   const [term, setTerm] = useState("");
   const [results, setResults] = useState<StockSnapshotRow[]>([]);
   const [cursor, setCursor] = useState(0);
   const [cart, setCart] = useState<CartLine[]>([]);
   const [activeLine, setActiveLine] = useState(0);
-  const [paymentMode, setPaymentMode] = useState<(typeof PAYMENT_MODES)[number]>("CASH");
-  const [customerName, setCustomerName] = useState("");
+  const [mode, setMode] = useState<(typeof MODES)[number]>("CASH");
+  const [customer, setCustomer] = useState("");
   const [busy, setBusy] = useState(false);
-  const [toast, setToast] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+  const [toast, setToast] = useState<{ ok: boolean; text: string } | null>(null);
+  const [session, setSession] = useState<{ storeId: string; storeName: string } | null>(null);
 
   const searchRef = useRef<HTMLInputElement>(null);
-
-  // Which counter this machine is. Read from the session saved at
-  // login — an offline browser cannot go and ask the server.
-  const [session, setSession] = useState<{
-    storeId: string;
-    storeName: string;
-    nodeKey: string;
-  } | null>(null);
-  const [snapAge, setSnapAge] = useState<number | null>(null);
-
   const storeId = session?.storeId ?? "";
 
   useEffect(() => {
     const raw = localStorage.getItem("vp_session");
-    if (!raw) {
-      window.location.href = "/login";
-      return;
-    }
+    if (!raw) return void (window.location.href = "/login");
     setSession(JSON.parse(raw));
   }, []);
 
-  // ── Connectivity ────────────────────────────────────────────
   useEffect(() => {
     const sync = () => setOnline(navigator.onLine);
     sync();
-    window.addEventListener("online", sync);
-    window.addEventListener("offline", sync);
+    addEventListener("online", sync);
+    addEventListener("offline", sync);
     return () => {
-      window.removeEventListener("online", sync);
-      window.removeEventListener("offline", sync);
+      removeEventListener("online", sync);
+      removeEventListener("offline", sync);
     };
   }, []);
 
   const refreshQueue = useCallback(() => pendingCount().then(setQueued), []);
-  useEffect(() => {
-    refreshQueue();
-  }, [refreshQueue]);
+  useEffect(() => void refreshQueue(), [refreshQueue]);
 
   // Flush the backlog the moment the connection returns.
   useEffect(() => {
@@ -121,38 +96,30 @@ export default function BillingCounterPage() {
           body: JSON.stringify(payload),
         }),
       );
-      if (sent > 0) setToast({ kind: "ok", text: `${sent} offline bill(s) synced.` });
-      refreshQueue();
+      if (sent > 0) setToast({ ok: true, text: `${sent} offline bill(s) synced` });
+      void refreshQueue();
     })();
   }, [online, refreshQueue]);
 
-  // ── Offline snapshot ────────────────────────────────────────
-  // Without this the offline mode is decorative: IndexedDB would be
-  // empty and an offline search would find nothing. Pulled on login
-  // and refreshed every 3 minutes while connected, so the counter is
-  // always at most 3 minutes stale when the line drops.
+  // Without this snapshot the offline mode is decorative — IndexedDB
+  // would be empty and an offline search would find nothing.
   useEffect(() => {
     if (!online || !storeId) return;
-
     const pull = async () => {
       try {
         const res = await fetch(`/api/stock/snapshot?storeId=${storeId}`);
         if (!res.ok) return;
-        const body = await res.json();
-        await saveSnapshot(body.rows);
+        await saveSnapshot((await res.json()).rows);
         setSnapAge(0);
       } catch {
-        /* stay on the old snapshot — a stale snapshot beats none */
+        /* keep the old snapshot — stale beats none */
       }
     };
-
     void pull();
     const t = setInterval(pull, 180_000);
     return () => clearInterval(t);
   }, [online, storeId]);
 
-  // Surface snapshot staleness while offline — the cashier should know
-  // how old the stock figures they are billing against actually are.
   useEffect(() => {
     if (online) return;
     const t = setInterval(() => void snapshotAge().then(setSnapAge), 30_000);
@@ -162,10 +129,7 @@ export default function BillingCounterPage() {
 
   // ── Search ──────────────────────────────────────────────────
   useEffect(() => {
-    if (term.trim().length < 2) {
-      setResults([]);
-      return;
-    }
+    if (term.trim().length < 2) return setResults([]);
     let cancelled = false;
     const t = setTimeout(async () => {
       try {
@@ -195,63 +159,59 @@ export default function BillingCounterPage() {
   }, [term, online, storeId]);
 
   // ── Cart ────────────────────────────────────────────────────
-  const addItem = useCallback(async (row: StockSnapshotRow, want = 1) => {
-    try {
-      // Pick batches the same way the server will, so what the
-      // patient is quoted matches what the bill finally says.
-      const picks = online
-        ? [{ ...row, quantity: Math.min(want, row.quantity) }]
-        : await fefoOffline(row.itemId, want);
+  const addItem = useCallback(
+    async (row: StockSnapshotRow, want = 1) => {
+      try {
+        const picks = online
+          ? [{ ...row, quantity: Math.min(want, row.quantity) }]
+          : await fefoOffline(row.itemId, want);
 
-      setCart((c) => {
-        const next = [...c];
-        for (const p of picks) {
-          const key = `${p.itemId}:${p.batchId}`;
-          const existing = next.findIndex((l) => l.key === key);
-          if (existing >= 0) {
-            next[existing] = { ...next[existing], quantity: next[existing].quantity + p.quantity };
-          } else {
-            next.push({
-              key,
-              itemId: p.itemId,
-              itemName: p.itemName,
-              batchId: p.batchId,
-              batchNo: p.batchNo,
-              expiryDate: p.expiryDate,
-              quantity: p.quantity,
-              mrp: Number(p.mrp),
-              rate: Number(p.saleRate || p.mrp),
-              gstRate: Number(p.gstRate),
-              schedule: p.schedule,
-            });
+        setCart((c) => {
+          const next = [...c];
+          for (const p of picks) {
+            const key = `${p.itemId}:${p.batchId}`;
+            const at = next.findIndex((l) => l.key === key);
+            if (at >= 0) next[at] = { ...next[at], quantity: next[at].quantity + p.quantity };
+            else
+              next.push({
+                key,
+                itemId: p.itemId,
+                itemName: p.itemName,
+                batchId: p.batchId,
+                batchNo: p.batchNo,
+                expiryDate: p.expiryDate,
+                quantity: p.quantity,
+                mrp: Number(p.mrp),
+                rate: Number(p.saleRate || p.mrp),
+                gstRate: Number(p.gstRate),
+                schedule: p.schedule,
+              });
           }
-        }
-        setActiveLine(next.length - 1);
-        return next;
-      });
+          setActiveLine(next.length - 1);
+          return next;
+        });
+        setTerm("");
+        setResults([]);
+        searchRef.current?.focus();
+      } catch (e) {
+        setToast({ ok: false, text: e instanceof Error ? e.message : "Could not add item." });
+      }
+    },
+    [online],
+  );
 
-      setTerm("");
-      setResults([]);
-      searchRef.current?.focus();
-    } catch (e) {
-      setToast({ kind: "err", text: e instanceof Error ? e.message : "Could not add item." });
-    }
-  }, [online]);
+  const setQty = (i: number, q: number) =>
+    setCart((c) => c.map((l, x) => (x === i ? { ...l, quantity: Math.max(0.001, q) } : l)));
+  const removeLine = (i: number) => setCart((c) => c.filter((_, x) => x !== i));
 
-  const setQty = (idx: number, q: number) =>
-    setCart((c) => c.map((l, i) => (i === idx ? { ...l, quantity: Math.max(0.001, q) } : l)));
-
-  const removeLine = (idx: number) => setCart((c) => c.filter((_, i) => i !== idx));
-
-  // ── Totals ──────────────────────────────────────────────────
   // Display only. The server recomputes everything and its numbers win —
   // never trust a total that came from a browser.
   const totals = useMemo(() => {
-    let taxable = 0;
-    let gst = 0;
+    let taxable = 0,
+      gst = 0;
     for (const l of cart) {
       const gross = l.quantity * l.rate;
-      const t = (gross * 100) / (100 + l.gstRate); // MRP is GST-inclusive
+      const t = (gross * 100) / (100 + l.gstRate);
       taxable += t;
       gst += gross - t;
     }
@@ -262,78 +222,59 @@ export default function BillingCounterPage() {
 
   const needsRx = cart.some((l) => l.schedule === "H1" || l.schedule === "NARCOTIC");
 
-  // ── Save ────────────────────────────────────────────────────
+  const reset = useCallback(() => {
+    setCart([]);
+    setCustomer("");
+    setActiveLine(0);
+    searchRef.current?.focus();
+  }, []);
+
   const saveBill = useCallback(async () => {
     if (!cart.length || busy) return;
     if (needsRx) {
       setToast({
-        kind: "err",
-        text: "Cart contains Schedule H1 / narcotic items — link a prescription before billing.",
+        ok: false,
+        text: "Schedule H1 / narcotic item in cart — link a prescription first.",
       });
       return;
     }
-
     setBusy(true);
     const clientUuid = newClientUuid();
     const payload = {
       storeId,
-      paymentMode,
-      customerName: customerName || undefined,
+      paymentMode: mode,
+      customerName: customer || undefined,
       clientUuid,
       isOfflineOrigin: !online,
-      lines: cart.map((l) => ({
-        itemId: l.itemId,
-        batchId: l.batchId,
-        quantity: l.quantity,
-      })),
+      lines: cart.map((l) => ({ itemId: l.itemId, batchId: l.batchId, quantity: l.quantity })),
     };
 
     try {
       if (!online) throw new Error("offline");
-
       const res = await fetch("/api/sales", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
-
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body.error ?? "Could not post the bill.");
-      }
-
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error ?? "Could not post the bill.");
       const { sale } = await res.json();
-      setToast({ kind: "ok", text: `${sale.billNo} · ${money(Number(sale.netAmount))}` });
-      resetCart();
+      setToast({ ok: true, text: `${sale.billNo} · ${inr(Number(sale.netAmount))}` });
+      reset();
     } catch (e) {
       const offlineNow = !navigator.onLine || (e instanceof Error && e.message === "offline");
       if (offlineNow) {
-        await queueSale({
-          clientUuid,
-          payload,
-          billNo: "OFFLINE",
-          netAmount: totals.rounded.toFixed(2),
-        });
-        await consumeSnapshot(
-          cart.map((l) => ({ itemId: l.itemId, batchId: l.batchId, qty: l.quantity })),
-        );
+        await queueSale({ clientUuid, payload, billNo: "OFFLINE", netAmount: totals.rounded.toFixed(2) });
+        await consumeSnapshot(cart.map((l) => ({ itemId: l.itemId, batchId: l.batchId, qty: l.quantity })));
         await refreshQueue();
-        setToast({ kind: "ok", text: `Billed offline · ${money(totals.rounded)} · will sync` });
-        resetCart();
+        setToast({ ok: true, text: `Billed offline · ${inr(totals.rounded)} · will sync` });
+        reset();
       } else {
-        setToast({ kind: "err", text: e instanceof Error ? e.message : "Failed." });
+        setToast({ ok: false, text: e instanceof Error ? e.message : "Failed." });
       }
     } finally {
       setBusy(false);
     }
-  }, [cart, busy, needsRx, storeId, paymentMode, customerName, online, totals, refreshQueue]);
-
-  function resetCart() {
-    setCart([]);
-    setCustomerName("");
-    setActiveLine(0);
-    searchRef.current?.focus();
-  }
+  }, [cart, busy, needsRx, storeId, mode, customer, online, totals, refreshQueue, reset]);
 
   // ── Keyboard ────────────────────────────────────────────────
   useEffect(() => {
@@ -343,7 +284,7 @@ export default function BillingCounterPage() {
         searchRef.current?.focus();
       } else if (e.key === "F4") {
         e.preventDefault();
-        setPaymentMode((m) => PAYMENT_MODES[(PAYMENT_MODES.indexOf(m) + 1) % PAYMENT_MODES.length]);
+        setMode((m) => MODES[(MODES.indexOf(m) + 1) % MODES.length]);
       } else if (e.key === "F6") {
         e.preventDefault();
         if (cart.length) removeLine(activeLine);
@@ -354,26 +295,12 @@ export default function BillingCounterPage() {
         if (results.length) {
           setResults([]);
           setTerm("");
-        } else resetCart();
+        } else reset();
       }
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [cart, activeLine, results.length, saveBill]);
-
-  const onSearchKey = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (!results.length) return;
-    if (e.key === "ArrowDown") {
-      e.preventDefault();
-      setCursor((c) => Math.min(c + 1, results.length - 1));
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      setCursor((c) => Math.max(c - 1, 0));
-    } else if (e.key === "Enter") {
-      e.preventDefault();
-      void addItem(results[cursor]);
-    }
-  };
+    addEventListener("keydown", onKey);
+    return () => removeEventListener("keydown", onKey);
+  }, [cart, activeLine, results.length, saveBill, reset]);
 
   useEffect(() => {
     if (!toast) return;
@@ -381,189 +308,277 @@ export default function BillingCounterPage() {
     return () => clearTimeout(t);
   }, [toast]);
 
-  // ── Render ──────────────────────────────────────────────────
   return (
-    <div className="pos">
-      <header className="bar">
-        <strong>{session?.storeName ?? "Billing Counter"}</strong>
-        <span className={online ? "pill ok" : "pill warn"}>
+    <div className="flex h-screen flex-col bg-slate-100">
+      {/* ── Header ──────────────────────────────────────────── */}
+      <header className="flex h-14 shrink-0 items-center gap-3 border-b border-slate-200 bg-white px-5">
+        <Link
+          href="/dashboard"
+          className="grid size-8 place-items-center rounded-lg text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-700"
+          title="Dashboard"
+        >
+          <LayoutDashboard className="size-4" />
+        </Link>
+        <div className="h-5 w-px bg-slate-200" />
+        <span className="font-semibold text-slate-800">{session?.storeName ?? "Billing Counter"}</span>
+
+        <span
+          className={cn(
+            "inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-semibold ring-1 ring-inset",
+            online
+              ? "bg-emerald-50 text-emerald-700 ring-emerald-200"
+              : "bg-amber-50 text-amber-700 ring-amber-200",
+          )}
+        >
+          {online ? <Wifi className="size-3" /> : <WifiOff className="size-3" />}
           {online ? "Online" : "Offline — billing continues"}
         </span>
+
         {!online && snapAge !== null && (
-          <span className="pill warn">
-            stock as of {Math.round(snapAge / 60000)} min ago
-          </span>
+          <Badge tone="warn">stock as of {Math.round(snapAge / 60000)} min ago</Badge>
         )}
-        {queued > 0 && <span className="pill info">{queued} bill(s) waiting to sync</span>}
-        <span className="spacer" />
-        <span className="keys">F2 search · F4 payment · F6 delete line · F9 save · Esc clear</span>
+        {queued > 0 && (
+          <Badge tone="brand">
+            <CloudUpload className="mr-1 inline size-3" />
+            {queued} waiting to sync
+          </Badge>
+        )}
+
+        <div className="ml-auto flex items-center gap-1.5 text-[11px] text-slate-400">
+          {[
+            ["F2", "search"],
+            ["F4", "payment"],
+            ["F6", "delete line"],
+            ["F9", "save"],
+            ["Esc", "clear"],
+          ].map(([k, v]) => (
+            <span key={k} className="inline-flex items-center gap-1">
+              <kbd className="rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-slate-500">
+                {k}
+              </kbd>
+              {v}
+            </span>
+          ))}
+        </div>
       </header>
 
-      <div className="grid">
-        <section className="left">
-          <input
-            ref={searchRef}
-            autoFocus
-            value={term}
-            onChange={(e) => setTerm(e.target.value)}
-            onKeyDown={onSearchKey}
-            placeholder="Scan barcode or type medicine / salt name…"
-            className="search"
-          />
+      {/* ── Body ────────────────────────────────────────────── */}
+      <div className="flex min-h-0 flex-1 gap-4 p-4">
+        {/* Cart side */}
+        <section className="flex min-w-0 flex-1 flex-col gap-3">
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-4 top-1/2 size-5 -translate-y-1/2 text-brand-500" />
+            <input
+              ref={searchRef}
+              autoFocus
+              value={term}
+              onChange={(e) => setTerm(e.target.value)}
+              onKeyDown={(e) => {
+                if (!results.length) return;
+                if (e.key === "ArrowDown") {
+                  e.preventDefault();
+                  setCursor((c) => Math.min(c + 1, results.length - 1));
+                } else if (e.key === "ArrowUp") {
+                  e.preventDefault();
+                  setCursor((c) => Math.max(c - 1, 0));
+                } else if (e.key === "Enter") {
+                  e.preventDefault();
+                  void addItem(results[cursor]);
+                }
+              }}
+              placeholder="Scan barcode or type medicine / salt name…"
+              className="h-14 w-full rounded-xl bg-white pl-12 pr-4 text-base shadow-sm ring-2 ring-brand-500 placeholder:text-slate-400 focus:outline-none focus:ring-brand-600"
+            />
 
-          {results.length > 0 && (
-            <ul className="results">
-              {results.map((r, i) => (
-                <li
-                  key={`${r.itemId}:${r.batchId}`}
-                  className={i === cursor ? "row sel" : "row"}
-                  onMouseEnter={() => setCursor(i)}
-                  onClick={() => void addItem(r)}
-                >
-                  <span className="nm">{r.itemName}</span>
-                  <span className="mut">
-                    {r.batchNo} · exp {r.expiryDate.slice(0, 7)}
-                  </span>
-                  <span className="mut">Qty {r.quantity}</span>
-                  <span className="amt">{money(Number(r.mrp))}</span>
-                </li>
-              ))}
-            </ul>
-          )}
+            {results.length > 0 && (
+              <ul className="absolute inset-x-0 top-16 z-20 max-h-72 overflow-auto rounded-xl bg-white py-1 shadow-xl ring-1 ring-slate-200">
+                {results.map((r, i) => (
+                  <li
+                    key={`${r.itemId}:${r.batchId}`}
+                    onMouseEnter={() => setCursor(i)}
+                    onClick={() => void addItem(r)}
+                    className={cn(
+                      "flex cursor-pointer items-center gap-3 px-4 py-2.5",
+                      i === cursor && "bg-brand-50",
+                    )}
+                  >
+                    <span className="min-w-0 flex-1 truncate text-sm font-medium text-slate-800">
+                      {r.itemName}
+                    </span>
+                    {r.schedule !== "NONE" && (
+                      <Badge tone={r.schedule === "NARCOTIC" ? "bad" : "warn"}>{r.schedule}</Badge>
+                    )}
+                    <span className="font-mono text-xs text-slate-400">{r.batchNo}</span>
+                    <span className="text-xs text-slate-400">exp {r.expiryDate.slice(0, 7)}</span>
+                    <span className="tabular text-xs text-slate-500">{r.quantity} in stock</span>
+                    <span className="tabular w-20 text-right text-sm font-semibold text-slate-800">
+                      {inr(Number(r.mrp))}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
 
-          <table className="cart">
-            <thead>
-              <tr>
-                <th>Item</th>
-                <th>Batch</th>
-                <th>Exp</th>
-                <th className="r">Qty</th>
-                <th className="r">MRP</th>
-                <th className="r">Amount</th>
-              </tr>
-            </thead>
-            <tbody>
-              {cart.length === 0 && (
+          <div className="min-h-0 flex-1 overflow-auto rounded-xl bg-white shadow-sm ring-1 ring-slate-200">
+            <table className="w-full text-sm">
+              <thead className="sticky top-0 bg-slate-50/95 backdrop-blur">
                 <tr>
-                  <td colSpan={6} className="empty">
-                    Cart is empty — press F2 and scan
-                  </td>
+                  {["Item", "Batch", "Expiry"].map((h) => (
+                    <th key={h} className="px-4 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                      {h}
+                    </th>
+                  ))}
+                  {["Qty", "MRP", "Amount", ""].map((h) => (
+                    <th key={h} className="px-4 py-2.5 text-right text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                      {h}
+                    </th>
+                  ))}
                 </tr>
-              )}
-              {cart.map((l, i) => (
-                <tr
-                  key={l.key}
-                  className={i === activeLine ? "sel" : ""}
-                  onClick={() => setActiveLine(i)}
-                >
-                  <td>
-                    {l.itemName}
-                    {l.schedule !== "NONE" && <em className="sched"> {l.schedule}</em>}
-                  </td>
-                  <td className="mut">{l.batchNo}</td>
-                  <td className="mut">{l.expiryDate.slice(0, 7)}</td>
-                  <td className="r">
-                    <input
-                      type="number"
-                      min={0.001}
-                      step={1}
-                      value={l.quantity}
-                      onChange={(e) => setQty(i, Number(e.target.value))}
-                      className="qty"
-                    />
-                  </td>
-                  <td className="r">{money(l.mrp)}</td>
-                  <td className="r">{money(l.quantity * l.rate)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {cart.length === 0 && (
+                  <tr>
+                    <td colSpan={7} className="py-24 text-center">
+                      <Search className="mx-auto mb-3 size-8 text-slate-300" />
+                      <p className="text-sm text-slate-400">
+                        Cart is empty — press{" "}
+                        <kbd className="rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 font-mono text-[10px]">
+                          F2
+                        </kbd>{" "}
+                        and scan
+                      </p>
+                    </td>
+                  </tr>
+                )}
+                {cart.map((l, i) => (
+                  <tr
+                    key={l.key}
+                    onClick={() => setActiveLine(i)}
+                    className={cn(
+                      "cursor-pointer border-b border-slate-50 transition-colors",
+                      i === activeLine ? "bg-brand-50/60" : "hover:bg-slate-50",
+                    )}
+                  >
+                    <td className="px-4 py-2.5">
+                      <span className="font-medium text-slate-800">{l.itemName}</span>
+                      {l.schedule !== "NONE" && (
+                        <Badge tone={l.schedule === "NARCOTIC" ? "bad" : "warn"} className="ml-2">
+                          {l.schedule}
+                        </Badge>
+                      )}
+                    </td>
+                    <td className="px-4 py-2.5 font-mono text-xs text-slate-500">{l.batchNo}</td>
+                    <td className="px-4 py-2.5 text-xs text-slate-500">{l.expiryDate.slice(0, 7)}</td>
+                    <td className="px-4 py-2.5 text-right">
+                      <input
+                        type="number"
+                        min={0.001}
+                        value={l.quantity}
+                        onChange={(e) => setQty(i, Number(e.target.value))}
+                        onClick={(e) => e.stopPropagation()}
+                        className="tabular w-20 rounded-lg border-0 bg-slate-50 px-2 py-1 text-right text-sm ring-1 ring-slate-200 focus:outline-none focus:ring-2 focus:ring-brand-500"
+                      />
+                    </td>
+                    <td className="tabular px-4 py-2.5 text-right text-slate-500">{inr(l.mrp)}</td>
+                    <td className="tabular px-4 py-2.5 text-right font-semibold text-slate-800">
+                      {inr(l.quantity * l.rate)}
+                    </td>
+                    <td className="px-2 py-2.5 text-right">
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          removeLine(i);
+                        }}
+                        className="grid size-7 place-items-center rounded-md text-slate-300 transition-colors hover:bg-red-50 hover:text-red-600"
+                      >
+                        <Trash2 className="size-3.5" />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </section>
 
-        <aside className="right">
+        {/* Totals side */}
+        <aside className="flex w-[340px] shrink-0 flex-col gap-3">
           <input
-            value={customerName}
-            onChange={(e) => setCustomerName(e.target.value)}
+            value={customer}
+            onChange={(e) => setCustomer(e.target.value)}
             placeholder="Patient name (optional)"
-            className="cust"
+            className="h-11 rounded-xl bg-white px-4 text-sm shadow-sm ring-1 ring-slate-200 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-brand-500"
           />
 
-          <div className="tot">
-            <div>
-              <span>Taxable</span>
-              <b>{money(totals.taxable)}</b>
-            </div>
-            <div>
-              <span>GST</span>
-              <b>{money(totals.gst)}</b>
-            </div>
-            <div>
-              <span>Round off</span>
-              <b>{money(totals.roundOff)}</b>
-            </div>
-            <div className="net">
-              <span>Net payable</span>
-              <b>{money(totals.rounded)}</b>
+          <div className="rounded-xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
+            {[
+              ["Taxable", totals.taxable],
+              ["GST", totals.gst],
+              ["Round off", totals.roundOff],
+            ].map(([label, v]) => (
+              <div key={label as string} className="flex justify-between py-1.5 text-sm">
+                <span className="text-slate-500">{label as string}</span>
+                <span className="tabular text-slate-700">{inr(v as number)}</span>
+              </div>
+            ))}
+            <div className="mt-3 flex items-end justify-between border-t-2 border-slate-100 pt-4">
+              <span className="text-sm font-medium text-slate-600">Net payable</span>
+              <span className="tabular text-3xl font-bold tracking-tight text-slate-900">
+                {inr(totals.rounded)}
+              </span>
             </div>
           </div>
 
-          <button className="mode" onClick={() => setPaymentMode((m) => PAYMENT_MODES[(PAYMENT_MODES.indexOf(m) + 1) % PAYMENT_MODES.length])}>
-            {paymentMode} <small>F4</small>
-          </button>
+          <div className="grid grid-cols-4 gap-1.5 rounded-xl bg-white p-1.5 shadow-sm ring-1 ring-slate-200">
+            {MODES.map((m) => (
+              <button
+                key={m}
+                onClick={() => setMode(m)}
+                className={cn(
+                  "rounded-lg py-2.5 text-xs font-semibold transition-colors",
+                  mode === m ? "bg-brand-600 text-white shadow-sm" : "text-slate-500 hover:bg-slate-50",
+                )}
+              >
+                {m}
+              </button>
+            ))}
+          </div>
 
           {needsRx && (
-            <p className="rxwarn">
-              Schedule H1 / narcotic item in cart. A linked prescription with the
-              prescriber&apos;s registration number is required before this can be dispensed.
-            </p>
+            <div className="flex gap-2.5 rounded-xl bg-amber-50 p-3.5 text-xs leading-relaxed text-amber-900 ring-1 ring-amber-200">
+              <ShieldAlert className="size-4 shrink-0" />
+              <span>
+                Schedule H1 / narcotic item in cart. A linked prescription with the prescriber&apos;s
+                registration number is required before this can be dispensed.
+              </span>
+            </div>
           )}
 
-          <button className="save" disabled={!cart.length || busy} onClick={() => void saveBill()}>
-            {busy ? "Saving…" : "Save & Print"} <small>F9</small>
-          </button>
+          <Button
+            variant="success"
+            className="h-14 text-base"
+            disabled={!cart.length || busy}
+            onClick={() => void saveBill()}
+          >
+            {busy ? <Loader2 className="size-5 animate-spin" /> : <Banknote className="size-5" />}
+            {busy ? "Saving…" : "Save & Print"}
+            <kbd className="ml-1 rounded bg-white/20 px-1.5 py-0.5 font-mono text-[10px]">F9</kbd>
+          </Button>
         </aside>
       </div>
 
-      {toast && <div className={`toast ${toast.kind}`}>{toast.text}</div>}
-
-      <style jsx>{`
-        .pos { font: 14px/1.45 system-ui, sans-serif; height: 100vh; display: flex; flex-direction: column; background: #f6f7f9; }
-        .bar { display: flex; gap: 12px; align-items: center; padding: 10px 16px; background: #fff; border-bottom: 1px solid #e3e6ea; }
-        .spacer { flex: 1; }
-        .keys { color: #8a929c; font-size: 12px; }
-        .pill { padding: 2px 10px; border-radius: 99px; font-size: 12px; font-weight: 600; }
-        .pill.ok { background: #e7f6ed; color: #1a7f43; }
-        .pill.warn { background: #fdf0e3; color: #a35b00; }
-        .pill.info { background: #e8effd; color: #1c50b5; }
-        .grid { flex: 1; display: grid; grid-template-columns: 1fr 320px; gap: 12px; padding: 12px; overflow: hidden; }
-        .left, .right { background: #fff; border: 1px solid #e3e6ea; border-radius: 10px; padding: 12px; overflow: auto; }
-        .search { width: 100%; padding: 12px 14px; font-size: 16px; border: 2px solid #2563eb; border-radius: 8px; outline: none; }
-        .results { list-style: none; margin: 6px 0 0; padding: 0; max-height: 240px; overflow: auto; border: 1px solid #e3e6ea; border-radius: 8px; }
-        .row { display: grid; grid-template-columns: 1fr auto auto auto; gap: 12px; padding: 8px 12px; cursor: pointer; border-bottom: 1px solid #f0f2f4; }
-        .row.sel { background: #eef4ff; }
-        .nm { font-weight: 600; }
-        .mut { color: #8a929c; font-size: 12px; }
-        .amt { font-variant-numeric: tabular-nums; font-weight: 600; }
-        .cart { width: 100%; border-collapse: collapse; margin-top: 14px; }
-        .cart th { text-align: left; font-size: 12px; color: #8a929c; border-bottom: 1px solid #e3e6ea; padding: 6px 8px; }
-        .cart td { padding: 6px 8px; border-bottom: 1px solid #f4f5f7; }
-        .cart tr.sel { background: #f5f8ff; }
-        .r { text-align: right; font-variant-numeric: tabular-nums; }
-        .empty { text-align: center; color: #a6adb6; padding: 40px 0; }
-        .qty { width: 70px; text-align: right; padding: 4px 6px; border: 1px solid #d6dae0; border-radius: 6px; }
-        .sched { color: #b4232a; font-style: normal; font-size: 11px; font-weight: 700; }
-        .cust { width: 100%; padding: 9px 12px; border: 1px solid #d6dae0; border-radius: 8px; margin-bottom: 12px; }
-        .tot div { display: flex; justify-content: space-between; padding: 6px 0; font-variant-numeric: tabular-nums; }
-        .tot .net { border-top: 2px solid #e3e6ea; margin-top: 6px; padding-top: 10px; font-size: 20px; }
-        .mode, .save { width: 100%; margin-top: 10px; padding: 12px; border-radius: 8px; border: 1px solid #d6dae0; background: #fff; font-weight: 700; cursor: pointer; }
-        .save { background: #16a34a; border-color: #16a34a; color: #fff; font-size: 16px; }
-        .save:disabled { background: #cfd4da; border-color: #cfd4da; cursor: not-allowed; }
-        .mode small, .save small { opacity: 0.65; font-weight: 500; margin-left: 6px; }
-        .rxwarn { margin-top: 12px; padding: 10px; background: #fdf0e3; color: #8a4b00; border-radius: 8px; font-size: 12px; }
-        .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); padding: 12px 22px; border-radius: 10px; color: #fff; font-weight: 600; }
-        .toast.ok { background: #16a34a; }
-        .toast.err { background: #dc2626; }
-      `}</style>
+      {toast && (
+        <div
+          className={cn(
+            "fixed bottom-6 left-1/2 flex -translate-x-1/2 items-center gap-2.5 rounded-xl px-5 py-3.5 text-sm font-semibold text-white shadow-2xl",
+            toast.ok ? "bg-emerald-600" : "bg-red-600",
+          )}
+        >
+          {toast.ok ? <CheckCircle2 className="size-5" /> : <TriangleAlert className="size-5" />}
+          {toast.text}
+        </div>
+      )}
     </div>
   );
 }
