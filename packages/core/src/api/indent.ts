@@ -3,7 +3,7 @@ import { z } from "zod";
 import { prisma } from "@velocare/core/lib/db";
 import { requireAuth } from "@velocare/core/server/auth";
 import {
-  createIndent, approveIndent, issueIndent, receiveIndent, IndentError,
+  createIndent, approveIndent, issueIndent, receiveIndent, returnToMain, IndentError,
 } from "@velocare/core/server/services/indent.service";
 import { InsufficientStockError, StoreOwnershipError } from "@velocare/core/server/services/stock.service";
 
@@ -144,6 +144,49 @@ export async function PATCH(req: NextRequest) {
         return NextResponse.json({ indent: await issueIndent(ctx, id) });
       case "receive":
         return NextResponse.json({ indent: await receiveIndent(ctx, id) });
+
+      // Ward sends unused stock back. The common real case: issued 40,
+      // consumed 30, ten strips go back on the main store's shelf
+      // rather than quietly expiring in a ward cupboard.
+      case "return": {
+        const body = await req.json().catch(() => ({}));
+        const parsed = z
+          .object({
+            remarks: z.string().max(300).optional(),
+            lines: z
+              .array(
+                z.object({
+                  itemId: z.string().min(1),
+                  batchId: z.string().min(1),
+                  quantity: z.coerce.number().positive(),
+                  rate: z.coerce.number().min(0),
+                }),
+              )
+              .min(1, "Select at least one batch to return."),
+          })
+          .parse(body);
+
+        const indent = await prisma.indent.findFirst({
+          where: { id, hospitalId: auth.user.hospitalId },
+          select: { fromStoreId: true, toStoreId: true, status: true },
+        });
+        if (!indent) return NextResponse.json({ error: "Indent not found." }, { status: 404 });
+        if (indent.status !== "RECEIVED") {
+          return NextResponse.json(
+            { error: "Only a received indent can have stock returned against it." },
+            { status: 422 },
+          );
+        }
+
+        return NextResponse.json({
+          result: await returnToMain(ctx, {
+            fromStoreId: indent.toStoreId,
+            toStoreId: indent.fromStoreId,
+            remarks: parsed.remarks,
+            lines: parsed.lines,
+          }),
+        });
+      }
       default:
         return NextResponse.json({ error: `Unknown action '${action}'.` }, { status: 400 });
     }

@@ -426,21 +426,28 @@ export async function traceBatch(
     patientName: string | null;
     patientPhone: string | null;
     quantity: Prisma.Decimal;
+    store: string;
+    isCancelled: boolean;
   }>
 > {
+  // Cancelled bills are INCLUDED, flagged rather than filtered. During
+  // a recall you need to know a cancelled bill existed — the goods may
+  // still have physically left the counter before it was voided.
   return tx.$queryRaw(Prisma.sql`
     SELECT
       s."billNo"        AS "billNo",
       s."billDate"      AS "billDate",
       COALESCE(p."name",  s."customerName")  AS "patientName",
       COALESCE(p."phone", s."customerPhone") AS "patientPhone",
-      sl."qty"          AS "quantity"
+      sl."qty"          AS "quantity",
+      st."code"         AS "store",
+      s."isCancelled"   AS "isCancelled"
     FROM "sale_lines" sl
     JOIN "sales" s     ON s."id" = sl."saleId"
+    JOIN "stores" st   ON st."id" = s."storeId"
     LEFT JOIN "patients" p ON p."id" = s."patientId"
     WHERE sl."batchId" = ${batchId}
       AND s."hospitalId" = ${ctx.hospitalId}
-      AND s."isCancelled" = FALSE
     ORDER BY s."billDate" DESC
   `);
 }

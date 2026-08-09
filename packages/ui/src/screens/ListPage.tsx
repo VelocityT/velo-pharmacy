@@ -152,6 +152,38 @@ export default function ListPage({ resource }: { resource: string }) {
                 {data.total.toLocaleString("en-IN")} record{data.total === 1 ? "" : "s"}
               </span>
             )}
+            {resource === "adjustments" && (
+              <Link href="/adjustments/new">
+                <Button>
+                  <Plus className="size-4" />
+                  New Adjustment
+                </Button>
+              </Link>
+            )}
+            {resource === "prescriptions" && (
+              <Link href="/prescriptions/new">
+                <Button>
+                  <Plus className="size-4" />
+                  New Prescription
+                </Button>
+              </Link>
+            )}
+            {resource === "salereturns" && (
+              <Link href="/returns/sale">
+                <Button>
+                  <Plus className="size-4" />
+                  New Credit Note
+                </Button>
+              </Link>
+            )}
+            {resource === "purchasereturns" && (
+              <Link href="/returns/purchase">
+                <Button>
+                  <Plus className="size-4" />
+                  New Debit Note
+                </Button>
+              </Link>
+            )}
             {resource === "indents" && (
               <Link href="/indents/new">
                 <Button>
@@ -269,12 +301,14 @@ export default function ListPage({ resource }: { resource: string }) {
                       onClick={() => {
                         if (resource === "indents" && r.id)
                           router.push(`/indents/${String(r.id)}`);
+                        if (resource === "adjustments" && r.id)
+                          router.push(`/adjustments/${String(r.id)}`);
                         if (resource === "sales" && r.billNo)
                           router.push(`/sales/${encodeURIComponent(String(r.billNo))}`);
                       }}
                       className={cn(
                         "transition-colors hover:bg-brand-50/40",
-                        (resource === "indents" || resource === "sales") && "cursor-pointer",
+                        ["indents", "sales", "adjustments"].includes(resource) && "cursor-pointer",
                       )}
                     >
                       {data.columns.filter((c) => c.key !== "id").map((c) => (

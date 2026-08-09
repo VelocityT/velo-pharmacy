@@ -9,6 +9,7 @@ import {
   ClipboardList, Scale, Lock, Percent, Pill, Users, UserRound, Store,
   KeyRound, PanelLeftClose, PanelLeft, LogOut, Wifi, WifiOff, ChevronRight,
   FileSpreadsheet, Landmark, BookOpen, Wallet, Warehouse, Undo2, PackageX,
+  ShieldAlert, FileText,
 } from "lucide-react";
 import { cn } from "../lib/cn";
 
@@ -32,8 +33,9 @@ const NAV: Array<{ group: string; items: NavItem[] }> = [
       { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
       { href: "/billing", label: "Billing Counter", icon: ScanBarcode },
       { href: "/sales", label: "Bills", icon: ReceiptText },
-      { href: "/prescriptions/new", label: "New Prescription", icon: Stethoscope },
+      { href: "/prescriptions", label: "Prescriptions", icon: Stethoscope },
       { href: "/returns/sale", label: "Sale Return", icon: Undo2 },
+      { href: "/salereturns", label: "Credit Notes", icon: FileText },
     ],
   },
   {
@@ -43,7 +45,8 @@ const NAV: Array<{ group: string; items: NavItem[] }> = [
       { href: "/expiry", label: "Expiry Watch", icon: Hourglass },
       { href: "/ledger", label: "Stock Ledger", icon: ScrollText },
       { href: "/indents", label: "Ward Indents", icon: ArrowLeftRight },
-      { href: "/adjustments/new", label: "Stock Adjustment", icon: SlidersHorizontal },
+      { href: "/adjustments", label: "Stock Adjustments", icon: SlidersHorizontal },
+      { href: "/recall", label: "Batch Recall Trace", icon: ShieldAlert },
     ],
   },
   {
@@ -52,6 +55,7 @@ const NAV: Array<{ group: string; items: NavItem[] }> = [
       { href: "/grns", label: "Goods Receipt", icon: PackagePlus },
       { href: "/suppliers", label: "Suppliers", icon: Factory },
       { href: "/returns/purchase", label: "Purchase Return", icon: PackageX },
+      { href: "/purchasereturns", label: "Debit Notes", icon: FileText },
       { href: "/purchase-orders", label: "Purchase Orders", icon: ClipboardList, soon: true },
     ],
   },

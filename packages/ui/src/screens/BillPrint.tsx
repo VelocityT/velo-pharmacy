@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Printer, ArrowLeft, Loader2 } from "lucide-react";
+import { Printer, ArrowLeft, Loader2, Ban } from "lucide-react";
 import Link from "next/link";
 import { Button } from "../components/ui";
 
@@ -58,6 +58,10 @@ function words(n: number): string {
 export default function BillPrint({ billNo }: { billNo: string }) {
   const [d, setD] = useState<Data | null>(null);
   const [err, setErr] = useState("");
+  const [cancelling, setCancelling] = useState(false);
+  const [reason, setReason] = useState("");
+  const [cancelErr, setCancelErr] = useState("");
+  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -69,6 +73,32 @@ export default function BillPrint({ billNo }: { billNo: string }) {
       setD(body);
     })();
   }, [billNo]);
+
+  async function doCancel() {
+    if (!d) return;
+    setBusy(true);
+    setCancelErr("");
+    try {
+      const res = await fetch(
+        `/api/recall?cancel=${encodeURIComponent(String((d.sale as Record<string, unknown>).id ?? ""))}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ reason: reason.trim() }),
+        },
+      );
+      const raw = await res.text();
+      if (!raw) throw new Error(`Server returned ${res.status} with no body.`);
+      const body = JSON.parse(raw);
+      if (!res.ok) throw new Error(body.error ?? "Could not cancel.");
+      setCancelling(false);
+      location.reload();
+    } catch (e) {
+      setCancelErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   if (err) return <div className="p-10 text-center text-sm text-red-600">{err}</div>;
   if (!d)
@@ -85,16 +115,64 @@ export default function BillPrint({ billNo }: { billNo: string }) {
   return (
     <div className="min-h-screen bg-slate-100 py-6 print:bg-white print:py-0">
       {/* Toolbar — screen only */}
-      <div className="mx-auto mb-4 flex max-w-[210mm] items-center justify-between px-4 print:hidden">
+      <div className="mx-auto mb-4 flex max-w-[210mm] items-center justify-between gap-3 px-4 print:hidden">
         <Link href="/sales">
           <Button variant="secondary" size="sm">
             <ArrowLeft className="size-3.5" /> Back to bills
           </Button>
         </Link>
-        <Button size="sm" onClick={() => window.print()}>
-          <Printer className="size-3.5" /> Print
-        </Button>
+        <div className="flex items-center gap-2">
+          {!Boolean(s.isCancelled) && (
+            <Button variant="danger" size="sm" onClick={() => setCancelling(true)}>
+              <Ban className="size-3.5" /> Cancel bill
+            </Button>
+          )}
+          <Button size="sm" onClick={() => window.print()}>
+            <Printer className="size-3.5" /> Print
+          </Button>
+        </div>
       </div>
+
+      {/* Cancellation appends reversal movements — it never deletes.
+          The ledger keeps showing that goods left and came back, and
+          the reason goes into the audit log, which is why it's required. */}
+      {cancelling && (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-slate-900/40 p-4 backdrop-blur-[2px] print:hidden">
+          <div className="w-full max-w-md rounded-xl bg-white p-6 shadow-2xl">
+            <h3 className="text-lg font-semibold tracking-tight">Cancel {String(s.billNo)}?</h3>
+            <p className="mt-1.5 text-sm text-slate-500">
+              Stock goes back on the shelf as a reversal entry. The bill is never deleted — it stays
+              queryable, marked cancelled.
+            </p>
+            <label className="mt-4 block text-xs font-semibold text-slate-700">
+              Reason <span className="text-red-500">*</span>
+            </label>
+            <input
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              placeholder="Wrong item dispensed"
+              autoFocus
+              className="mt-1.5 h-10 w-full rounded-lg bg-white px-3 text-sm ring-1 ring-slate-200 focus:outline-none focus:ring-2 focus:ring-brand-500"
+            />
+            {cancelErr && (
+              <p className="mt-2 text-xs font-medium text-red-600">{cancelErr}</p>
+            )}
+            <div className="mt-5 flex justify-end gap-2">
+              <Button variant="secondary" onClick={() => setCancelling(false)}>
+                Keep bill
+              </Button>
+              <Button
+                variant="danger"
+                disabled={reason.trim().length < 3 || busy}
+                onClick={() => void doCancel()}
+              >
+                {busy ? <Loader2 className="size-4 animate-spin" /> : <Ban className="size-4" />}
+                Cancel bill
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="invoice mx-auto max-w-[210mm] bg-white p-8 shadow-sm print:max-w-none print:p-0 print:shadow-none">
         {/* Header */}

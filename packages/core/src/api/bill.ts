@@ -112,6 +112,7 @@ export async function GET(req: NextRequest) {
   return NextResponse.json({
     hospital,
     sale: {
+      id: sale.id,
       billNo: sale.billNo,
       billDate: sale.billDate,
       saleType: sale.saleType,

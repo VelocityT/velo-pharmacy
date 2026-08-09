@@ -374,6 +374,115 @@ export const RESOURCES: Record<string, ResourceDef> = {
     `,
   },
 
+
+  // ── Documents that had no history screen ────────────────────
+  adjustments: {
+    title: "Stock Adjustments",
+    subtitle: "Write-offs and physical counts — draft until a second person approves",
+    roles: ALL,
+    searchable: true,
+    columns: [
+      { key: "adjNo", label: "Adj No" },
+      { key: "adjDate", label: "Date", type: "date" },
+      { key: "store", label: "Store" },
+      { key: "reason", label: "Reason", type: "badge" },
+      { key: "lines", label: "Lines", type: "qty", align: "right" },
+      { key: "netUnits", label: "Net Units", type: "qty", align: "right" },
+      { key: "valueImpact", label: "Value Impact", type: "money", align: "right" },
+      { key: "raisedBy", label: "Raised By" },
+      { key: "status", label: "Status", type: "badge" },
+    ],
+    sql: ({ hospitalId }) => Prisma.sql`
+      SELECT a."id", a."adjNo", a."adjDate", st."code" AS store,
+             a."reason"::text AS reason,
+             (SELECT count(*) FROM stock_adjustment_lines l WHERE l."adjId"=a."id") AS lines,
+             COALESCE((SELECT SUM(l."diffQty") FROM stock_adjustment_lines l WHERE l."adjId"=a."id"),0) AS "netUnits",
+             COALESCE((SELECT SUM(l."diffQty"*l."rate") FROM stock_adjustment_lines l WHERE l."adjId"=a."id"),0) AS "valueImpact",
+             COALESCE(u."name",'—') AS "raisedBy",
+             CASE WHEN a."isPosted" THEN 'POSTED' ELSE 'DRAFT' END AS status
+      FROM stock_adjustments a
+      JOIN stores st ON st."id"=a."storeId"
+      LEFT JOIN users u ON u."id"=a."createdBy"
+      WHERE a."hospitalId"=${hospitalId}
+    `,
+  },
+
+  salereturns: {
+    title: "Credit Notes",
+    subtitle: "Medicine returned by patients",
+    roles: ALL,
+    searchable: true,
+    columns: [
+      { key: "returnNo", label: "Credit Note" },
+      { key: "returnDate", label: "Date", type: "date" },
+      { key: "billNo", label: "Against Bill" },
+      { key: "store", label: "Counter" },
+      { key: "lines", label: "Items", type: "qty", align: "right" },
+      { key: "reason", label: "Reason" },
+      { key: "netAmount", label: "Refunded", type: "money", align: "right" },
+    ],
+    sql: ({ hospitalId }) => Prisma.sql`
+      SELECT r."returnNo", r."returnDate", s."billNo", st."code" AS store,
+             (SELECT count(*) FROM sale_return_lines l WHERE l."returnId"=r."id") AS lines,
+             COALESCE(r."reason",'—') AS reason, r."netAmount"
+      FROM sale_returns r
+      JOIN sales s   ON s."id"=r."saleId"
+      JOIN stores st ON st."id"=r."storeId"
+      WHERE r."hospitalId"=${hospitalId}
+    `,
+  },
+
+  purchasereturns: {
+    title: "Debit Notes",
+    subtitle: "Stock sent back to suppliers for credit",
+    roles: [...MANAGER, "PURCHASE_OFFICER", "ACCOUNTANT", "AUDITOR"],
+    searchable: true,
+    columns: [
+      { key: "returnNo", label: "Debit Note" },
+      { key: "returnDate", label: "Date", type: "date" },
+      { key: "supplier", label: "Supplier" },
+      { key: "reason", label: "Reason", type: "badge" },
+      { key: "lines", label: "Batches", type: "qty", align: "right" },
+      { key: "netAmount", label: "Claimable", type: "money", align: "right" },
+      { key: "status", label: "Status", type: "badge" },
+    ],
+    sql: ({ hospitalId }) => Prisma.sql`
+      SELECT r."returnNo", r."returnDate", sup."name" AS supplier, r."reason",
+             (SELECT count(*) FROM purchase_return_lines l WHERE l."returnId"=r."id") AS lines,
+             r."netAmount",
+             CASE WHEN r."isPosted" THEN 'POSTED' ELSE 'DRAFT' END AS status
+      FROM purchase_returns r
+      JOIN suppliers sup ON sup."id"=r."supplierId"
+      WHERE r."hospitalId"=${hospitalId}
+    `,
+  },
+
+  prescriptions: {
+    title: "Prescriptions",
+    subtitle: "Required before Schedule H1 or narcotic drugs can be dispensed",
+    roles: ALL,
+    searchable: true,
+    columns: [
+      { key: "rxNo", label: "Rx No" },
+      { key: "rxDate", label: "Date", type: "date" },
+      { key: "patient", label: "Patient" },
+      { key: "doctor", label: "Prescriber" },
+      { key: "regNo", label: "Reg No" },
+      { key: "drugs", label: "Drugs", type: "qty", align: "right" },
+      { key: "status", label: "Status", type: "badge" },
+    ],
+    sql: ({ hospitalId }) => Prisma.sql`
+      SELECT rx."rxNo", rx."rxDate", p."name" AS patient, d."name" AS doctor,
+             COALESCE(d."registrationNo",'⚠ missing') AS "regNo",
+             (SELECT count(*) FROM prescription_lines l WHERE l."rxId"=rx."id") AS drugs,
+             CASE WHEN rx."isDispensed" THEN 'DISPENSED' ELSE 'PENDING' END AS status
+      FROM prescriptions rx
+      JOIN patients p ON p."id"=rx."patientId"
+      JOIN doctors  d ON d."id"=rx."doctorId"
+      WHERE rx."hospitalId"=${hospitalId}
+    `,
+  },
+
   // ── Settings ────────────────────────────────────────────────
   stores: {
     title: "Stores & Counters",
