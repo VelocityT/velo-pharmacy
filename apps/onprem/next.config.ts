@@ -12,6 +12,7 @@ loadEnv({ path: join(__dirname, "../../.env") });
 const config: NextConfig = {
   reactStrictMode: true,
   transpilePackages: ["@velocare/core", "@velocare/ui"],
+  outputFileTracingRoot: join(__dirname, "../../"),
   // standalone bundles the server so the hospital's machine never
   // needs an npm install — the image moves on a USB stick.
   output: "standalone",

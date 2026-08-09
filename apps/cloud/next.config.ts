@@ -19,6 +19,10 @@ loadEnv({ path: join(__dirname, "../../.env") });
 const config: NextConfig = {
   reactStrictMode: true,
   transpilePackages: ["@velocare/core", "@velocare/ui"],
+  // This app lives in a workspace, so Next cannot infer the repo root
+  // on its own. Without this it traces the wrong files at build time
+  // and the deployed function is missing packages/.
+  outputFileTracingRoot: join(__dirname, "../../"),
 };
 
 export default config;
