@@ -21,7 +21,8 @@
     "db:studio": "dotenv -e .env -- prisma studio --schema packages/core/prisma/schema.prisma",
     "stock:rebuild": "dotenv -e .env -- tsx packages/core/scripts/rebuild-stock-balance.ts",
     "test": "node packages/core/tests/gst.spec.mjs",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "verify": "npm run typecheck && npm test"
   },
   "devDependencies": {
     "dotenv": "^16.4.7",
