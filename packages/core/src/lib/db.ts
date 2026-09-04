@@ -4,28 +4,45 @@ import { env } from "./env";
 /**
  * Prisma client + tenant isolation.
  *
- * hospitalId is injected by a client extension rather than left to
- * the caller, because eventually a caller forgets — and a forgotten
- * hospitalId in a multi-tenant pharmacy is a cross-hospital data leak.
+ * LAZY, for the same reason env.ts is: `next build` imports every route
+ * handler while collecting page data. Constructing a PrismaClient at
+ * module load would read DATABASE_URL at build time and fail the build
+ * on a machine that legitimately has no database.
  *
- * In cloud mode this is backed up by Postgres RLS (see
- * prisma/migrations/*_rls). Two independent layers on purpose.
+ * The exported `prisma` is a Proxy that constructs the real client on
+ * first use. Call sites are unchanged — `prisma.sale.findFirst(...)`
+ * works exactly as before.
+ *
+ * hospitalId is injected by a client extension rather than left to the
+ * caller, because eventually a caller forgets — and a forgotten
+ * hospitalId in a multi-tenant pharmacy is a cross-hospital data leak.
  */
-
-const base = () =>
-  new PrismaClient({
-    log:
-      env.NODE_ENV === "development"
-        ? ["warn", "error"]
-        : ["error"],
-  });
 
 const globalForPrisma = globalThis as unknown as { prisma?: PrismaClient };
 
-export const prisma = globalForPrisma.prisma ?? base();
-if (env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
+function client(): PrismaClient {
+  if (globalForPrisma.prisma) return globalForPrisma.prisma;
 
-/** Models that are NOT tenant-scoped or are scoped via their parent. */
+  const c = new PrismaClient({
+    log: env.NODE_ENV === "development" ? ["warn", "error"] : ["error"],
+  });
+
+  // Reuse across hot reloads in dev and across warm serverless
+  // invocations in production — a new client per request exhausts the
+  // connection pool within minutes.
+  globalForPrisma.prisma = c;
+  return c;
+}
+
+export const prisma: PrismaClient = new Proxy({} as PrismaClient, {
+  get(_t, prop: string | symbol) {
+    const c = client() as unknown as Record<string | symbol, unknown>;
+    const value = c[prop];
+    return typeof value === "function" ? value.bind(c) : value;
+  },
+});
+
+/** Models that are NOT tenant-scoped, or are scoped via their parent. */
 const UNSCOPED = new Set<string>([
   "Hospital",
   "UserStore",
@@ -57,14 +74,14 @@ const READ_OPS = new Set([
 const WRITE_OPS = new Set(["create", "createMany", "upsert"]);
 
 /**
- * Returns a client permanently bound to one hospital.
- * Every route handler should obtain its client through this and
- * never touch the raw `prisma` export directly.
+ * Returns a client permanently bound to one hospital. Route handlers
+ * should obtain their client through this rather than touching the raw
+ * `prisma` export.
  */
 export function forHospital(hospitalId: string) {
   if (!hospitalId) throw new Error("forHospital() called without hospitalId");
 
-  return prisma.$extends({
+  return client().$extends({
     name: "tenant-isolation",
     query: {
       $allModels: {

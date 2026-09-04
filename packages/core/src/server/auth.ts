@@ -16,7 +16,12 @@ import { env } from "@velocare/core/lib/env";
  * role alone cannot express that.
  */
 
-const secret = new TextEncoder().encode(env.JWT_SECRET);
+/**
+ * Lazy, like env and prisma. Reading JWT_SECRET at module load would
+ * make `next build` require the signing key just to collect page data.
+ */
+let _secret: Uint8Array | null = null;
+const secret = () => (_secret ??= new TextEncoder().encode(env.JWT_SECRET));
 
 export interface AuthUser {
   id: string;
@@ -30,7 +35,7 @@ export async function signToken(user: AuthUser, nodeId?: string | null) {
     .setProtectedHeader({ alg: "HS256" })
     .setIssuedAt()
     .setExpirationTime(env.JWT_EXPIRES_IN)
-    .sign(secret);
+    .sign(secret());
 }
 
 type AuthResult =
@@ -49,7 +54,7 @@ export async function requireAuth(
   }
 
   try {
-    const { payload } = await jwtVerify(token, secret);
+    const { payload } = await jwtVerify(token, secret());
     const user: AuthUser = {
       id: String(payload.id),
       hospitalId: String(payload.hospitalId),
