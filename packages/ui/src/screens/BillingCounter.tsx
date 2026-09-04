@@ -13,6 +13,9 @@ import {
 import { Badge, Button } from "../components/ui";
 import { cn } from "../lib/cn";
 
+/** Client-side twin of AUTH_DISABLED — see packages/core/src/server/auth.ts. */
+const AUTH_OFF = process.env.NEXT_PUBLIC_AUTH_DISABLED === "true";
+
 /**
  * ────────────────────────────────────────────────────────────────
  *  BILLING COUNTER
@@ -66,6 +69,19 @@ export default function BillingCounter() {
   const storeId = session?.storeId ?? "";
 
   useEffect(() => {
+    // Login bypass — no localStorage session exists, so ask the server
+    // which store this counter should bill from.
+    if (AUTH_OFF) {
+      fetch("/api/auth/session")
+        .then((r) => r.json())
+        .then((d) => {
+          if (d.storeId) setSession({ storeId: d.storeId, storeName: d.storeName });
+          else setToast({ ok: false, text: d.error ?? "No billing store found." });
+        })
+        .catch(() => setToast({ ok: false, text: "Could not reach the server." }));
+      return;
+    }
+
     const raw = localStorage.getItem("vp_session");
     if (!raw) return void (window.location.href = "/login");
     setSession(JSON.parse(raw));

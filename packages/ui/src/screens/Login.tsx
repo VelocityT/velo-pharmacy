@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Loader2, TriangleAlert, Monitor, Lock, Mail } from "lucide-react";
 import { Button, Input, Label, Card } from "../components/ui";
@@ -13,8 +13,18 @@ import { Button, Input, Label, Card } from "../components/ui";
  * disconnected session cannot go back and ask the server which
  * counter it is.
  */
+/** Client-side twin of AUTH_DISABLED — see AppShell.tsx. */
+const AUTH_OFF = process.env.NEXT_PUBLIC_AUTH_DISABLED === "true";
+
 export default function LoginPage() {
   const router = useRouter();
+
+  // With the bypass on, this page has nothing to do. Anyone who lands
+  // here (bookmark, old tab, direct URL) goes straight through.
+  useEffect(() => {
+    if (AUTH_OFF) router.replace("/dashboard");
+  }, [router]);
+
   const [email, setEmail] = useState("pharmacist@velocare.in");
   const [password, setPassword] = useState("Demo@12345");
   const [nodeKey, setNodeKey] = useState("COUNTER-01");

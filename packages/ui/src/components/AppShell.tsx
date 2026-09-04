@@ -94,6 +94,13 @@ const NAV: Array<{ group: string; items: NavItem[] }> = [
   },
 ];
 
+/**
+ * Client-side twin of AUTH_DISABLED. Must be NEXT_PUBLIC_ to reach the
+ * browser, and is inlined at build time — so changing it needs a
+ * restart of `npm run dev`, not just a refresh.
+ */
+const AUTH_OFF = process.env.NEXT_PUBLIC_AUTH_DISABLED === "true";
+
 interface Session {
   user: { name: string; role: string };
   storeName: string;
@@ -108,6 +115,20 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   const [collapsed, setCollapsed] = useState(false);
 
   useEffect(() => {
+    setCollapsed(localStorage.getItem("vp_nav_collapsed") === "1");
+
+    // Login bypass — see AUTH_DISABLED in packages/core/src/server/auth.ts.
+    // The server already accepts every request, so the shell must stop
+    // bouncing to /login or nothing is reachable.
+    if (AUTH_OFF) {
+      setSession({
+        user: { name: "Developer", role: "SUPER_ADMIN" },
+        storeName: "All stores",
+        storeCode: "DEV",
+      });
+      return;
+    }
+
     const raw = localStorage.getItem("vp_session");
     if (!raw) return router.replace("/login");
     try {
@@ -115,7 +136,6 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     } catch {
       router.replace("/login");
     }
-    setCollapsed(localStorage.getItem("vp_nav_collapsed") === "1");
   }, [router]);
 
   useEffect(() => {
@@ -137,6 +157,9 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   }
 
   function signOut() {
+    // Nothing to sign out of while the bypass is on; sending the user
+    // to /login would only bounce them straight back.
+    if (AUTH_OFF) return;
     localStorage.removeItem("vp_session");
     document.cookie = "vp_token=; Max-Age=0; path=/";
     router.replace("/login");
